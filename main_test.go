@@ -1722,3 +1722,436 @@ data: [DONE]
 		t.Errorf("first event content = %q", events[0].Content)
 	}
 }
+
+// ============================================================================
+// 15. Flux Klein 4B Image Server Tests
+// ============================================================================
+
+func TestNeedsImageGeneration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		// Japanese keywords
+		{"画像生成して", true},
+		{"画像を生成してください", true},
+		{"画像を作って", true},
+		{"インフォグラフィックを作って", true},
+		{"インフォグラフィクスを作って", true},
+		{"写真を生成して", true},
+		{"写真を作って", true},
+		{"絵を描いて", true},
+		{"絵を生成して", true},
+		{"コンセプトアートを描いて", true},
+		// English keywords
+		{"generate an image of a cat", true},
+		{"image generation please", true},
+		{"generate image of sunset", true},
+		{"concept art of a dragon", true},
+		// Should NOT match
+		{"今日のニュースを教えて", false},
+		{"コードを書いて", false},
+		{"検索して", false},
+		{"hello world", false},
+		{"ダイアグラムを描いて", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		got := needsImageGeneration(tt.input)
+		if got != tt.expected {
+			t.Errorf("needsImageGeneration(%q) = %v, want %v", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestInitImageServerDir(t *testing.T) {
+	// Save and restore imageServerDir
+	origDir := imageServerDir
+	defer func() { imageServerDir = origDir }()
+
+	tmp := t.TempDir()
+	// Override HOME to isolate
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmp)
+	defer os.Setenv("HOME", origHome)
+
+	err := initImageServerDir()
+	if err != nil {
+		t.Fatalf("initImageServerDir() failed: %v", err)
+	}
+
+	// Verify directory was created
+	expectedDir := filepath.Join(tmp, ".siki", "image_server")
+	if imageServerDir != expectedDir {
+		t.Errorf("imageServerDir = %q, want %q", imageServerDir, expectedDir)
+	}
+
+	// Verify server.py was written
+	scriptPath := filepath.Join(expectedDir, "server.py")
+	data, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("server.py not found: %v", err)
+	}
+	if !strings.Contains(string(data), "FastAPI") {
+		t.Error("server.py should contain FastAPI import")
+	}
+	if !strings.Contains(string(data), "Flux Klein 4B") {
+		t.Error("server.py should contain Flux Klein 4B header")
+	}
+
+	// Verify output directory
+	outputDir := filepath.Join(expectedDir, "output")
+	if info, err := os.Stat(outputDir); err != nil || !info.IsDir() {
+		t.Error("output directory should exist")
+	}
+}
+
+func TestGenerateImage_MockServer(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	// Create a mock image server
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":       "ready",
+				"model_loaded": true,
+			})
+		case "/generate":
+			var req struct {
+				Prompt string `json:"prompt"`
+				Width  int    `json:"width"`
+				Height int    `json:"height"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+
+			if req.Prompt == "" {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "prompt is required"})
+				return
+			}
+
+			// Return a tiny 1x1 PNG as base64
+			pngBase64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"image_base64": pngBase64,
+				"width":        req.Width,
+				"height":       req.Height,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockServer.Close()
+
+	// Mark server as ready (skip actual startup)
+	imageServerReady = true
+	defer func() { imageServerReady = false }()
+
+	config := &Config{
+		ImageEndpoint: mockServer.URL,
+		ImageModel:    "black-forest-labs/FLUX.2-klein-4B",
+		ImageEnabled:  true,
+	}
+
+	urlPath, err := generateImage("a beautiful sunset", 512, 512, config)
+	if err != nil {
+		t.Fatalf("generateImage failed: %v", err)
+	}
+
+	if !strings.HasPrefix(urlPath, "/playground/image_") {
+		t.Errorf("expected /playground/image_*.png path, got %q", urlPath)
+	}
+	if !strings.HasSuffix(urlPath, ".png") {
+		t.Errorf("expected .png suffix, got %q", urlPath)
+	}
+
+	// Verify the file was actually written to playground
+	filename := strings.TrimPrefix(urlPath, "/playground/")
+	filePath := filepath.Join(playgroundDir, filename)
+	if _, err := os.Stat(filePath); err != nil {
+		t.Errorf("generated image file not found at %s: %v", filePath, err)
+	}
+}
+
+func TestGenerateImage_ServerError(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ready", "model_loaded": true})
+		case "/generate":
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": "GPU out of memory"})
+		}
+	}))
+	defer mockServer.Close()
+
+	imageServerReady = true
+	defer func() { imageServerReady = false }()
+
+	config := &Config{
+		ImageEndpoint: mockServer.URL,
+		ImageEnabled:  true,
+	}
+
+	_, err := generateImage("test prompt", 512, 512, config)
+	if err == nil {
+		t.Fatal("expected error from server 500, got nil")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("error should contain status 500, got: %v", err)
+	}
+}
+
+func TestGenerateImage_CustomDimensions(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	var receivedWidth, receivedHeight int
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ready", "model_loaded": true})
+		case "/generate":
+			var req struct {
+				Width  int `json:"width"`
+				Height int `json:"height"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			receivedWidth = req.Width
+			receivedHeight = req.Height
+
+			pngBase64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"image_base64": pngBase64,
+				"width":        req.Width,
+				"height":       req.Height,
+			})
+		}
+	}))
+	defer mockServer.Close()
+
+	imageServerReady = true
+	defer func() { imageServerReady = false }()
+
+	config := &Config{ImageEndpoint: mockServer.URL, ImageEnabled: true}
+	_, err := generateImage("test", 768, 1024, config)
+	if err != nil {
+		t.Fatalf("generateImage failed: %v", err)
+	}
+	if receivedWidth != 768 {
+		t.Errorf("width = %d, want 768", receivedWidth)
+	}
+	if receivedHeight != 1024 {
+		t.Errorf("height = %d, want 1024", receivedHeight)
+	}
+}
+
+func TestEnsureImageServer_AlreadyRunning(t *testing.T) {
+	// If server is already marked as ready, ensureImageServer should return immediately
+	imageServerReady = true
+	defer func() { imageServerReady = false }()
+
+	config := &Config{ImageEndpoint: "http://localhost:9999", ImageEnabled: true}
+	err := ensureImageServer(config)
+	if err != nil {
+		t.Errorf("ensureImageServer should succeed when already ready, got: %v", err)
+	}
+}
+
+func TestEnsureImageServer_ExternalServer(t *testing.T) {
+	// Reset state
+	imageServerReady = false
+	defer func() { imageServerReady = false }()
+
+	// Create mock external server
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ready", "model_loaded": true})
+		}
+	}))
+	defer mockServer.Close()
+
+	config := &Config{ImageEndpoint: mockServer.URL, ImageEnabled: true}
+	err := ensureImageServer(config)
+	if err != nil {
+		t.Fatalf("ensureImageServer failed with external server: %v", err)
+	}
+	if !imageServerReady {
+		t.Error("imageServerReady should be true after detecting external server")
+	}
+}
+
+func TestEnsureImageServer_DefaultEndpoint(t *testing.T) {
+	imageServerReady = false
+	defer func() { imageServerReady = false }()
+
+	// Empty endpoint should default to localhost:8100
+	config := &Config{ImageEndpoint: "", ImageEnabled: true}
+
+	// This will fail because no server is running on 8100 and we can't start one in tests
+	// but it exercises the default endpoint code path
+	err := ensureImageServer(config)
+	// Expect error since no server and no python/gpu in test env
+	if err == nil {
+		// Only passes if something is actually running on 8100
+		imageServerReady = false
+	}
+}
+
+func TestGenerateImage_ExecuteTool(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	// Create mock image server
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ready", "model_loaded": true})
+		case "/generate":
+			pngBase64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"image_base64": pngBase64,
+				"width":        512,
+				"height":       512,
+			})
+		}
+	}))
+	defer mockServer.Close()
+
+	imageServerReady = true
+	defer func() { imageServerReady = false }()
+
+	config := &Config{
+		ImageEndpoint: mockServer.URL,
+		ImageModel:    "black-forest-labs/FLUX.2-klein-4B",
+		ImageEnabled:  true,
+	}
+
+	agent := &Agent{config: config}
+	result, err := agent.executeTool("generate_image", map[string]interface{}{
+		"prompt": "a cute cat sitting on a rainbow",
+		"width":  float64(512),
+		"height": float64(512),
+	})
+	if err != nil {
+		t.Fatalf("executeTool generate_image failed: %v", err)
+	}
+	if !strings.Contains(result, "Image generated successfully") {
+		t.Errorf("expected success message, got: %s", result)
+	}
+	if !strings.Contains(result, "/playground/image_") {
+		t.Errorf("expected image URL in result, got: %s", result)
+	}
+	if !strings.Contains(result, "![Generated Image]") {
+		t.Errorf("expected markdown image, got: %s", result)
+	}
+}
+
+func TestGenerateImage_ExecuteTool_NoPrompt(t *testing.T) {
+	cleanup := setupTestDirs(t)
+	defer cleanup()
+
+	config := &Config{ImageEnabled: true}
+	agent := &Agent{config: config}
+
+	_, err := agent.executeTool("generate_image", map[string]interface{}{})
+	if err == nil {
+		t.Fatal("expected error for missing prompt")
+	}
+	if !strings.Contains(err.Error(), "prompt is required") {
+		t.Errorf("expected 'prompt is required' error, got: %v", err)
+	}
+}
+
+func TestImageServerScript_Content(t *testing.T) {
+	t.Parallel()
+
+	// Verify the embedded Python script has all required endpoints
+	if !strings.Contains(imageServerScript, "@app.get(\"/health\")") {
+		t.Error("script missing /health endpoint")
+	}
+	if !strings.Contains(imageServerScript, "@app.post(\"/generate\")") {
+		t.Error("script missing /generate endpoint")
+	}
+	if !strings.Contains(imageServerScript, "@app.post(\"/load\")") {
+		t.Error("script missing /load endpoint")
+	}
+	if !strings.Contains(imageServerScript, "DiffusionPipeline") {
+		t.Error("script should use DiffusionPipeline for auto-detection")
+	}
+	if !strings.Contains(imageServerScript, "FLUX_MODEL") {
+		t.Error("script should read FLUX_MODEL environment variable")
+	}
+	if !strings.Contains(imageServerScript, "FLUX_FP8") {
+		t.Error("script should support FLUX_FP8 quantization flag")
+	}
+	if !strings.Contains(imageServerScript, "image_base64") {
+		t.Error("script should return image_base64 in response")
+	}
+}
+
+func TestImageConfigDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	if cfg.ImageModel != "black-forest-labs/FLUX.2-klein-4B" {
+		t.Errorf("default ImageModel = %q, want FLUX.2-klein-4B", cfg.ImageModel)
+	}
+	if cfg.ImageEndpoint != "http://localhost:8100" {
+		t.Errorf("default ImageEndpoint = %q, want http://localhost:8100", cfg.ImageEndpoint)
+	}
+	if !cfg.ImageEnabled {
+		t.Error("ImageEnabled should default to true")
+	}
+}
+
+func TestGenerateImageTool_Definition(t *testing.T) {
+	t.Parallel()
+
+	var found bool
+	for _, tool := range tools {
+		if tool.Name == "generate_image" {
+			found = true
+			if !strings.Contains(tool.Description, "Flux Klein 4B") {
+				t.Error("tool description should mention Flux Klein 4B")
+			}
+			params := tool.Parameters
+			props, ok := params["properties"].(map[string]interface{})
+			if !ok {
+				t.Fatal("properties should be a map")
+			}
+			if _, ok := props["prompt"]; !ok {
+				t.Error("should have prompt parameter")
+			}
+			if _, ok := props["width"]; !ok {
+				t.Error("should have width parameter")
+			}
+			if _, ok := props["height"]; !ok {
+				t.Error("should have height parameter")
+			}
+			required, ok := params["required"].([]string)
+			if !ok {
+				t.Fatal("required should be a string slice")
+			}
+			if len(required) != 1 || required[0] != "prompt" {
+				t.Errorf("required = %v, want [prompt]", required)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("generate_image tool not found in builtinTools")
+	}
+}
