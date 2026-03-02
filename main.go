@@ -3118,16 +3118,40 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 
 	prompt := fmt.Sprintf(`あなたはタスク分解の専門家。ユーザーの複雑なリクエストを実行可能なステップに分解せよ。
 
-## 利用可能なツール
-- web_search: インターネット検索。引数不要（実行時に自動設定）
-- web_fetch: URL内容取得。引数不要（前のタスク結果から自動抽出）
-- run_code: HTML/JS/Canvas実行（ゲーム・シミュレーション・インタラクティブ可視化）
-- diagram: Graphviz図生成（構成図・関係図・フロー図）
-- generate_image: AI画像生成（インフォグラフィック・イラスト・コンセプトアート・写真風画像）。Flux Klein 4Bモデルで高品質画像を生成。
-- execute_command: シェルコマンド実行
-- read_file: ファイル読込
-- write_file: ファイル書込
-- summarize: 中間まとめ（ツール呼び出しなし）
+## 利用可能なツール（使い分けに注意）
+- web_search: インターネット検索
+- web_fetch: URL内容取得
+- run_code: HTMLコード実行。ゲーム・シミュレーション・インタラクティブUI等、プログラムを書く必要があるもの専用
+- diagram: Graphviz DOT図。ノードとエッジで表す関係図・フロー図専用
+- generate_image: AI画像生成。インフォグラフィック・イラスト・ポスター・写真風画像等、ビジュアルコンテンツを生成。プロンプトからAIが画像を描く
+- execute_command: シェルコマンド
+- read_file / write_file: ファイル操作
+- summarize: ツール不要の中間まとめ
+
+## ビジュアル出力の使い分け（重要）
+| ユーザーの要求 | 正しいツール | 間違い |
+|---|---|---|
+| インフォグラフィック作って | generate_image | ~~run_code~~ |
+| イラスト描いて | generate_image | ~~run_code~~ |
+| 画像を生成して | generate_image | ~~diagram~~ |
+| ゲームを作って | run_code | - |
+| シミュレーション | run_code | - |
+| 関係図・フロー図 | diagram | - |
+
+## 例1: 「〇〇を調べてインフォグラフィックにして」
+{"tasks":[
+{"id":1,"description":"〇〇について検索","tool":"web_search"},
+{"id":2,"description":"検索上位のページを取得","tool":"web_fetch"},
+{"id":3,"description":"情報を要約","tool":"summarize"},
+{"id":4,"description":"要約をもとにインフォグラフィック画像を生成","tool":"generate_image"}
+]}
+
+## 例2: 「〇〇を調べて関係図にして」
+{"tasks":[
+{"id":1,"description":"〇〇について検索","tool":"web_search"},
+{"id":2,"description":"検索上位のページを取得","tool":"web_fetch"},
+{"id":3,"description":"関係図をGraphvizで生成","tool":"diagram"}
+]}
 
 ## 会話履歴
 %s
@@ -3135,22 +3159,13 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 ## ユーザーのリクエスト
 %s
 
-## 出力形式
-以下のJSONのみ出力せよ（他の文章は書くな）:
-{"tasks": [
-  {"id": 1, "description": "タスクの説明", "tool": "使うツール名"},
-  {"id": 2, "description": "タスクの説明", "tool": "使うツール名"}
-]}
+## 出力形式（JSON以外書くな）
+{"tasks": [{"id": 1, "description": "...", "tool": "ツール名"}, ...]}
 
 ## ルール
-- 各タスクは1つのツール呼び出しに対応させろ
-- タスクは実行順に並べろ
-- 3〜10個のタスクに分解しろ
-- 各タスクの説明は具体的にしろ（何を検索するか、何を実行するか）
-- ツール不要の中間ステップ（まとめ・分析）には tool を "summarize" にしろ
-- 「インフォグラフィック」「図にして」「画像」「イラスト」等のビジュアル出力要求がある場合、最終タスクに generate_image を必ず含めろ
-- generate_image はテキストプロンプトからAI画像を生成する。run_code（HTML）やdiagram（Graphviz）とは別物
-- 調査→まとめ→画像生成 の流れが自然`, ctx.String(), userMsg)
+- 各タスクは1つのツール呼び出し
+- 実行順に並べろ。3〜10個
+- 説明は具体的に（何を検索するか等）`, ctx.String(), userMsg)
 
 	// Use sub-agent for plan creation if available (better at complex decomposition)
 	var response string
@@ -3751,7 +3766,7 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - read_file: ファイル読込。引数: {"path": "ファイルパス"}
 - write_file: ファイル書込。引数: {"path": "パス", "content": "内容"}
 - generate_image: AI画像生成（Flux Klein 4B）。インフォグラフィック・イラスト・コンセプトアート。引数: {"prompt": "英語の詳細プロンプト"}
-- plan: 複雑なタスクを複数ステップに分解して順次実行。引数: {"goal": "達成したい目標"}
+- plan: 複雑なタスクを複数ステップに分解して順次実行。引数: {"goal": "ユーザーのリクエストそのまま"}
 
 ## 会話履歴
 %s
@@ -3760,12 +3775,12 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 
 ## 注意
 - 今日は%d年%d月%d日
-- run_codeの場合、完全で美しいHTMLを生成せよ（<html>から</html>まで、CSS/JS全部含む）
+- run_codeはゲーム・シミュレーション・インタラクティブUI等のプログラム実行専用
+- generate_imageはインフォグラフィック・イラスト・ポスター等の画像生成専用（run_codeと混同するな）
 - web_searchの場合、適切な検索クエリを指定
 - 複数のツールを組み合わせる必要がある複雑なリクエスト（調査→分析→可視化など）には plan を使え
-- 「〇〇を調べて図にして」「〇〇について調査してまとめて」のような複合タスクには plan を使え
+- planのgoalにはユーザーのリクエストをそのまま入れろ。実装方法（HTML等）を勝手に追加するな
 - 単純な1ステップの作業にはplanを使うな
-- generate_imageの場合、英語で詳細な画像プロンプトを指定。「画像生成して」「イラスト描いて」「インフォグラフィック」等のリクエストに使え
 - ツール不要（挨拶・計算・知識質問）なら直接回答
 
 以下のJSON形式のみ出力せよ（他の文章は絶対に書くな）:
@@ -4646,10 +4661,10 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		fmt.Printf("[siki] Entering plan mode for: %s\n", userMsg)
 		sendEvent(StreamEvent{Type: "thinking", Content: "複雑なタスクを検出。プランを作成中..."})
 
+		// Always use the user's original message as the goal.
+		// Do NOT use decision.Args["goal"] — the sub-model may inject biased
+		// implementation details (e.g., "via HTML") that constrain createPlan.
 		goal := userMsg
-		if g, ok := decision.Args["goal"].(string); ok && g != "" {
-			goal = g
-		}
 
 		plan, err := createPlan(goal, agent.messages, ws.config)
 		if err != nil {
