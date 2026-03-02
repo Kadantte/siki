@@ -66,6 +66,9 @@ type Config struct {
 	SubModel        string     `json:"sub_model"`
 	SubModelBackend string     `json:"sub_model_backend"` // "ollama" (default) or "vllm"
 	SubModelEndpoint string    `json:"sub_model_endpoint"` // optional separate endpoint for sub-model
+	SubAgent         string    `json:"sub_agent"`          // powerful model for summarization/code gen (e.g. Qwen3.5-27B)
+	SubAgentBackend  string    `json:"sub_agent_backend"`  // "vllm" (default) or "ollama"
+	SubAgentEndpoint string    `json:"sub_agent_endpoint"` // endpoint for sub-agent (e.g. http://localhost:8000)
 	ImageModel      string     `json:"image_model"`      // default: "black-forest-labs/FLUX.2-klein-4B"
 	ImageEndpoint   string     `json:"image_endpoint"`   // default: "http://localhost:8100"
 	ImageEnabled    bool       `json:"image_enabled"`    // default: true
@@ -997,10 +1000,10 @@ func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interfac
 		}
 
 	case "diagram":
-		// For diagrams, delegate DOT generation to sub-model
-		if config.SubModel != "" {
+		// For diagrams, delegate DOT generation to sub-agent (or sub-model)
+		if config.SubModel != "" || hasSubAgent(config) {
 			prompt := fmt.Sprintf("以下のリクエストに対して、Graphviz DOTコードのみ出力せよ（説明不要）。\nリクエスト: %s", userMsg)
-			_, dotCode, err := callSubModel(prompt, config)
+			_, dotCode, err := callSubAgent(prompt, config)
 			if err == nil && len(dotCode) > 10 {
 				// Extract DOT code from response
 				dot := dotCode
@@ -1033,14 +1036,14 @@ func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interfac
 		// File operations: trust model's args (path/content from user context)
 
 	case "generate_image":
-		// Enhance prompt: convert user's Japanese request to detailed English prompt via sub-model
-		if config.SubModel != "" {
+		// Enhance prompt: convert user's Japanese request to detailed English prompt via sub-agent
+		if config.SubModel != "" || hasSubAgent(config) {
 			enhancePrompt := fmt.Sprintf(`以下のユーザーリクエストから、画像生成AI用の英語プロンプトを生成せよ。
 詳細で描写的な英語プロンプトのみを出力し、他の文章は書くな。
 スタイル指定（digital art, infographic, illustration等）を含めること。
 
 ユーザーリクエスト: %s`, userMsg)
-			_, enhanced, err := callSubModel(enhancePrompt, config)
+			_, enhanced, err := callSubAgent(enhancePrompt, config)
 			if err == nil && len(enhanced) > 10 {
 				enhanced = strings.TrimSpace(enhanced)
 				// Remove markdown code blocks if present
@@ -2481,6 +2484,167 @@ func isSubModelVLLM(config *Config) bool {
 	return config.SubModelBackend == "vllm"
 }
 
+// ============================================================================
+// Sub-Agent: powerful model for summarization, code generation, analysis
+// Falls back to sub-model when sub-agent is not configured.
+// ============================================================================
+
+// hasSubAgent returns true if a sub-agent model is configured.
+func hasSubAgent(config *Config) bool {
+	return config.SubAgent != ""
+}
+
+// subAgentEndpoint returns the endpoint URL for the sub-agent.
+func subAgentEndpoint(config *Config) string {
+	if config.SubAgentEndpoint != "" {
+		return strings.TrimSuffix(config.SubAgentEndpoint, "/")
+	}
+	// Fall back to sub-model endpoint, then primary endpoint
+	return subModelEndpoint(config)
+}
+
+// isSubAgentVLLM returns true if the sub-agent backend is vllm.
+func isSubAgentVLLM(config *Config) bool {
+	if config.SubAgentBackend != "" {
+		return config.SubAgentBackend == "vllm"
+	}
+	return true // default to vllm for sub-agent (typically large models)
+}
+
+// callSubAgent calls the sub-agent model for complex tasks.
+// Falls back to callSubModel if no sub-agent is configured.
+func callSubAgent(prompt string, config *Config) (thinking string, response string, err error) {
+	if !hasSubAgent(config) {
+		return callSubModel(prompt, config)
+	}
+
+	endpoint := subAgentEndpoint(config)
+
+	if isSubAgentVLLM(config) {
+		content, err := callVLLMGenerate(config.SubAgent, prompt, 32768, 300*time.Second, endpoint)
+		if err != nil {
+			fmt.Printf("[siki] Sub-agent call failed, falling back to sub-model: %v\n", err)
+			return callSubModel(prompt, config)
+		}
+		return "", content, nil
+	}
+
+	// Ollama path for sub-agent
+	reqBody := map[string]interface{}{
+		"model":      config.SubAgent,
+		"prompt":     prompt,
+		"stream":     false,
+		"keep_alive": -1,
+		"options": map[string]interface{}{
+			"num_predict": 32768,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Printf("[siki] Sub-agent call failed, falling back to sub-model: %v\n", err)
+		return callSubModel(prompt, config)
+	}
+	defer resp.Body.Close()
+
+	var genResp struct {
+		Response string `json:"response"`
+		Thinking string `json:"thinking"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", "", fmt.Errorf("sub-agent decode error: %w", err)
+	}
+
+	content := genResp.Response
+	thinking = genResp.Thinking
+	if content == "" && thinking != "" {
+		content = thinking
+		thinking = ""
+	}
+	// Strip inline <think> tags
+	if ti := strings.Index(content, "<think>"); ti >= 0 {
+		if te := strings.Index(content, "</think>"); te > ti {
+			thinking = strings.TrimSpace(content[ti+7 : te])
+			content = strings.TrimSpace(content[:ti] + content[te+8:])
+		}
+	}
+	return thinking, content, nil
+}
+
+// streamSubAgentGenerate streams from the sub-agent (or falls back to sub-model streaming).
+func streamSubAgentGenerate(prompt string, config *Config, sendEvent func(StreamEvent)) (string, error) {
+	if !hasSubAgent(config) {
+		// Fall back to sub-model streaming
+		return streamSubModelSummarize("", "none", prompt, config, sendEvent)
+	}
+
+	endpoint := subAgentEndpoint(config)
+
+	if isSubAgentVLLM(config) {
+		return streamVLLMGenerate(config.SubAgent, prompt, 32768, 300*time.Second, endpoint, sendEvent)
+	}
+
+	// Ollama streaming for sub-agent
+	reqBody := map[string]interface{}{
+		"model":      config.SubAgent,
+		"prompt":     prompt,
+		"stream":     true,
+		"keep_alive": -1,
+		"options": map[string]interface{}{
+			"num_predict": 32768,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("sub-agent stream error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var fullResponse strings.Builder
+	inThinking := false
+	decoder := json.NewDecoder(resp.Body)
+	for decoder.More() {
+		var chunk struct {
+			Response string `json:"response"`
+			Thinking string `json:"thinking"`
+			Done     bool   `json:"done"`
+		}
+		if err := decoder.Decode(&chunk); err != nil {
+			break
+		}
+		if chunk.Thinking != "" {
+			inThinking = true
+			continue
+		}
+		if inThinking && chunk.Response != "" {
+			inThinking = false
+		}
+		if chunk.Response != "" {
+			text := chunk.Response
+			if strings.Contains(text, "<think>") || strings.Contains(text, "</think>") {
+				continue
+			}
+			fullResponse.WriteString(text)
+			sendEvent(StreamEvent{Type: "content", Content: text})
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	return fullResponse.String(), nil
+}
+
 // callVLLMGenerate calls a model via vllm's OpenAI-compatible /v1/chat/completions endpoint.
 // Returns the generated text with <think> tags stripped.
 func callVLLMGenerate(model, prompt string, maxTokens int, timeout time.Duration, endpoint string) (string, error) {
@@ -2680,12 +2844,11 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 	return thinking, content, nil
 }
 
-// generateCodeWithSubModel delegates code generation to the sub-model (e.g., gpt-oss:20b)
-// for higher quality output. The orchestrator (1.2B) decides WHAT tool to call,
-// the sub-model generates the actual code. Returns complete HTML string.
+// generateCodeWithSubModel delegates code generation to the sub-agent (or sub-model).
+// The orchestrator decides WHAT tool to call, the sub-agent generates the actual code.
 func generateCodeWithSubModel(userRequest string, config *Config) (string, error) {
-	if config.SubModel == "" {
-		return "", fmt.Errorf("no sub-model configured")
+	if config.SubModel == "" && config.SubAgent == "" {
+		return "", fmt.Errorf("no sub-model or sub-agent configured")
 	}
 
 	prompt := fmt.Sprintf(`以下のリクエストに対して、完全なHTMLページを生成せよ。
@@ -2699,6 +2862,25 @@ func generateCodeWithSubModel(userRequest string, config *Config) (string, error
 - 日本語UIにすること
 
 リクエスト: %s`, userRequest)
+
+	// Use sub-agent for code generation if available
+	if hasSubAgent(config) {
+		fmt.Printf("[siki] Using sub-agent (%s) for code generation\n", config.SubAgent)
+		_, content, err := callSubAgent(prompt, config)
+		if err != nil {
+			return "", fmt.Errorf("sub-agent code gen error: %w", err)
+		}
+		// Extract HTML from response
+		if idx := strings.Index(content, "<html"); idx >= 0 {
+			content = content[idx:]
+			if end := strings.LastIndex(content, "</html>"); end >= 0 {
+				content = content[:end+7]
+			}
+		} else if idx := strings.Index(content, "<!DOCTYPE"); idx >= 0 {
+			content = content[idx:]
+		}
+		return content, nil
+	}
 
 	endpoint := subModelEndpoint(config)
 
@@ -2964,9 +3146,18 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 - タスクは実行順に並べろ
 - 3〜10個のタスクに分解しろ
 - 各タスクの説明は具体的にしろ（何を検索するか、何を実行するか）
-- ツール不要の中間ステップ（まとめ・分析）には tool を "summarize" にしろ`, ctx.String(), userMsg)
+- ツール不要の中間ステップ（まとめ・分析）には tool を "summarize" にしろ
+- generate_image: AI画像生成（インフォグラフィック、イラスト等）も利用可能`, ctx.String(), userMsg)
 
-	response, err := callOllamaGenerate(config.SubModel, prompt, 4096, 600*time.Second, config)
+	// Use sub-agent for plan creation if available (better at complex decomposition)
+	var response string
+	var err error
+	if hasSubAgent(config) {
+		fmt.Printf("[siki] Using sub-agent (%s) for plan creation\n", config.SubAgent)
+		_, response, err = callSubAgent(prompt, config)
+	} else {
+		response, err = callOllamaGenerate(config.SubModel, prompt, 4096, 600*time.Second, config)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("plan creation failed: %w", err)
 	}
@@ -3383,7 +3574,7 @@ func (ws *WebServer) executePlan(ctx context.Context, plan *Plan, planID string,
 まとめ内容: %s
 
 目標: %s`, summary[:min(len(summary), 2000)], plan.Goal)
-			_, imgPrompt, err := callSubModel(imgPromptReq, ws.config)
+			_, imgPrompt, err := callSubAgent(imgPromptReq, ws.config)
 			if err == nil && len(imgPrompt) > 10 {
 				imgPrompt = strings.TrimSpace(imgPrompt)
 				urlPath, err := generateImage(imgPrompt, 768, 768, ws.config)
@@ -4070,8 +4261,12 @@ func generateSuggestions(userMsg, response, toolName string) []string {
 // streamSubModelSummarize streams gpt-oss's summary response token-by-token via SSE.
 func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Config, sendEvent func(StreamEvent)) (string, error) {
 	result := toolResult
-	if len(result) > 20000 {
-		result = result[:20000] + "\n... (以下省略)"
+	maxResult := 20000
+	if hasSubAgent(config) {
+		maxResult = 60000 // Sub-agent can handle larger context
+	}
+	if len(result) > maxResult {
+		result = result[:maxResult] + "\n... (以下省略)"
 	}
 
 	prompt := fmt.Sprintf(`## 絶対ルール
@@ -4093,6 +4288,12 @@ func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Confi
 %s
 
 上記のツール結果のみに基づいて、日本語で詳しく回答せよ。`, userMsg, toolName, result)
+
+	// Use sub-agent for summarization if available (more powerful model)
+	if hasSubAgent(config) {
+		fmt.Printf("[siki] Using sub-agent (%s) for summarization\n", config.SubAgent)
+		return streamSubAgentGenerate(prompt, config, sendEvent)
+	}
 
 	endpoint := subModelEndpoint(config)
 
@@ -4460,15 +4661,15 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 	if toolName == "generate_image" {
 		prompt, _ := args["prompt"].(string)
 		if prompt == "" {
-			// Auto-enhance user's message to English image prompt via sub-model
-			if ws.config.SubModel != "" {
+			// Auto-enhance user's message to English image prompt via sub-agent
+			if ws.config.SubModel != "" || hasSubAgent(ws.config) {
 				sendEvent(StreamEvent{Type: "thinking", Content: "画像プロンプトを生成中..."})
 				enhanceReq := fmt.Sprintf(`以下のユーザーリクエストから、画像生成AI用の英語プロンプトを生成せよ。
 詳細で描写的な英語プロンプトのみを出力し、他の文章は書くな。
 スタイル指定（digital art, infographic, illustration等）を含めること。
 
 ユーザーリクエスト: %s`, userMsg)
-				_, enhanced, err := callSubModel(enhanceReq, ws.config)
+				_, enhanced, err := callSubAgent(enhanceReq, ws.config)
 				if err == nil && len(enhanced) > 10 {
 					enhanced = strings.TrimSpace(enhanced)
 					enhanced = strings.TrimPrefix(enhanced, "```")
@@ -10613,7 +10814,18 @@ func runWeb(config *Config, host string, port int) error {
 		fmt.Printf("Vision Model: %s\n", config.VisionModel)
 	}
 	if config.SubModel != "" {
-		fmt.Printf("Sub Model: %s\n", config.SubModel)
+		fmt.Printf("Sub Model: %s (%s)\n", config.SubModel, config.SubModelBackend)
+	}
+	if config.SubAgent != "" {
+		backend := config.SubAgentBackend
+		if backend == "" {
+			backend = "vllm"
+		}
+		endpoint := config.SubAgentEndpoint
+		if endpoint == "" {
+			endpoint = "(same as sub-model)"
+		}
+		fmt.Printf("Sub Agent: %s (%s, %s)\n", config.SubAgent, backend, endpoint)
 	}
 	// Image generation status
 	if config.ImageEnabled {
@@ -10870,6 +11082,24 @@ func main() {
 		case "--sub-endpoint":
 			if i+1 < len(args) {
 				config.SubModelEndpoint = args[i+1]
+				i += 2
+				continue
+			}
+		case "--sub-agent":
+			if i+1 < len(args) {
+				config.SubAgent = args[i+1]
+				i += 2
+				continue
+			}
+		case "--sub-agent-backend":
+			if i+1 < len(args) {
+				config.SubAgentBackend = args[i+1]
+				i += 2
+				continue
+			}
+		case "--sub-agent-endpoint":
+			if i+1 < len(args) {
+				config.SubAgentEndpoint = args[i+1]
 				i += 2
 				continue
 			}
