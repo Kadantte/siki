@@ -3204,41 +3204,31 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 		return nil, fmt.Errorf("plan has no tasks")
 	}
 
-	// Post-process: if user wants image generation, ensure generate_image is in the plan
+	// Post-process: if user wants image generation, FORCE last task to generate_image
+	// The sub-model consistently ignores prompt instructions, so we override unconditionally.
 	if needsImageGeneration(userMsg) {
-		hasImageTask := false
-		for _, t := range planData.Tasks {
-			if t.Tool == "generate_image" {
-				hasImageTask = true
-				break
+		lastIdx := len(planData.Tasks) - 1
+		if lastIdx >= 0 {
+			oldTool := planData.Tasks[lastIdx].Tool
+			if oldTool != "generate_image" {
+				fmt.Printf("[siki] Plan post-process: forcing last task (%s → generate_image)\n", oldTool)
+				planData.Tasks[lastIdx].Tool = "generate_image"
+				planData.Tasks[lastIdx].Description = "調査結果をもとにAI画像（インフォグラフィック）を生成する"
 			}
 		}
-		if !hasImageTask {
-			// Replace last run_code/diagram task with generate_image, or append one
-			replaced := false
-			for i := len(planData.Tasks) - 1; i >= 0; i-- {
-				if planData.Tasks[i].Tool == "run_code" || planData.Tasks[i].Tool == "diagram" {
-					fmt.Printf("[siki] Plan post-process: replacing task %d (%s → generate_image)\n", planData.Tasks[i].ID, planData.Tasks[i].Tool)
-					planData.Tasks[i].Tool = "generate_image"
-					planData.Tasks[i].Description = "調査結果をもとにAI画像（インフォグラフィック）を生成する"
-					replaced = true
-					break
-				}
+		// Also remove any intermediate write_file/run_code tasks that are HTML-generation artifacts
+		filtered := planData.Tasks[:0]
+		for _, t := range planData.Tasks {
+			if t.Tool == "write_file" || (t.Tool == "run_code" && t.ID != planData.Tasks[lastIdx].ID) {
+				fmt.Printf("[siki] Plan post-process: removing HTML artifact task %d (%s)\n", t.ID, t.Tool)
+				continue
 			}
-			if !replaced {
-				// Append a generate_image task
-				newID := planData.Tasks[len(planData.Tasks)-1].ID + 1
-				planData.Tasks = append(planData.Tasks, struct {
-					ID          int    `json:"id"`
-					Description string `json:"description"`
-					Tool        string `json:"tool"`
-				}{
-					ID:          newID,
-					Description: "調査結果をもとにAI画像（インフォグラフィック）を生成する",
-					Tool:        "generate_image",
-				})
-				fmt.Printf("[siki] Plan post-process: appended generate_image task (id=%d)\n", newID)
-			}
+			filtered = append(filtered, t)
+		}
+		planData.Tasks = filtered
+		// Re-number tasks sequentially
+		for i := range planData.Tasks {
+			planData.Tasks[i].ID = i + 1
 		}
 	}
 
