@@ -3337,8 +3337,16 @@ func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, s
 		decision = OrchestratorDecision{Tool: task.Tool, Args: map[string]interface{}{}}
 	}
 
-	// Execute the tool
+	// Execute the tool — normalize common typos from sub-model
 	toolName := decision.Tool
+	toolAliases := map[string]string{
+		"diagrams": "diagram", "search": "web_search", "fetch": "web_fetch",
+		"image": "generate_image", "code": "run_code", "command": "execute_command",
+	}
+	if alias, ok := toolAliases[toolName]; ok {
+		fmt.Printf("[siki] Plan task: normalizing tool '%s' → '%s'\n", toolName, alias)
+		toolName = alias
+	}
 	if toolName == "" || toolName == "none" || toolName == "summarize" {
 		// No tool needed - use sub-model for summarization
 		if decision.Response != "" {
@@ -7615,17 +7623,62 @@ func startImageServer(config *Config) error {
 	venvDir := filepath.Join(imageServerDir, "venv")
 	venvPython := filepath.Join(venvDir, "bin", "python3")
 	if _, err := os.Stat(venvPython); os.IsNotExist(err) {
-		fmt.Println("[siki] Creating Python venv for image server...")
-		venvCmd := exec.Command("python3", "-m", "venv", venvDir)
+		fmt.Println("[siki] Creating Python venv for image server (--system-site-packages)...")
+		venvCmd := exec.Command("python3", "-m", "venv", "--system-site-packages", venvDir)
 		venvCmd.Stdout = os.Stdout
 		venvCmd.Stderr = os.Stderr
 		if err := venvCmd.Run(); err != nil {
 			return fmt.Errorf("failed to create venv: %w", err)
 		}
-		// Install dependencies
-		fmt.Println("[siki] Installing image server dependencies (this may take a few minutes)...")
-		pipCmd := exec.Command(filepath.Join(venvDir, "bin", "pip"), "install",
-			"diffusers", "transformers", "accelerate", "torch",
+		pip := filepath.Join(venvDir, "bin", "pip")
+		// Check if CUDA-enabled torch is already available (from system or other venv)
+		checkCmd := exec.Command(venvPython, "-c", "import torch; assert torch.cuda.is_available(), 'no CUDA'")
+		if err := checkCmd.Run(); err != nil {
+			// No CUDA torch in system — try to find one from existing venvs
+			fmt.Println("[siki] No CUDA torch found in system, searching existing venvs...")
+			home, _ := os.UserHomeDir()
+			found := false
+			candidates := []string{
+				filepath.Join(home, "knowledgeCore", "venv", "bin", "python3"),
+				filepath.Join(home, ".egox_venv", "bin", "python"),
+			}
+			for _, cand := range candidates {
+				if _, serr := os.Stat(cand); serr == nil {
+					checkCand := exec.Command(cand, "-c", "import torch; print(torch.__path__[0])")
+					if out, cerr := checkCand.Output(); cerr == nil {
+						torchPath := strings.TrimSpace(string(out))
+						fmt.Printf("[siki] Found CUDA torch at: %s\n", torchPath)
+						// Create .pth file to add the site-packages to our venv
+						siteDir := filepath.Dir(torchPath)
+						pthFile := filepath.Join(venvDir, "lib")
+						// Find the python version dir
+						entries, _ := os.ReadDir(pthFile)
+						for _, e := range entries {
+							if strings.HasPrefix(e.Name(), "python") {
+								pthPath := filepath.Join(pthFile, e.Name(), "site-packages", "cuda_torch.pth")
+								os.WriteFile(pthPath, []byte(siteDir+"\n"), 0644)
+								fmt.Printf("[siki] Added %s to venv path\n", siteDir)
+								found = true
+								break
+							}
+						}
+						if found {
+							break
+						}
+					}
+				}
+			}
+			if !found {
+				fmt.Println("[siki] WARNING: No CUDA torch found. Image generation may fail on GPU.")
+				fmt.Println("[siki] Install torch+CUDA manually: pip install torch --index-url https://download.pytorch.org/whl/cu124")
+			}
+		} else {
+			fmt.Println("[siki] CUDA torch available from system packages")
+		}
+		// Install non-torch dependencies
+		fmt.Println("[siki] Installing image server dependencies...")
+		pipCmd := exec.Command(pip, "install",
+			"diffusers", "transformers", "accelerate",
 			"fastapi", "uvicorn", "Pillow", "sentencepiece", "protobuf")
 		pipCmd.Stdout = os.Stdout
 		pipCmd.Stderr = os.Stderr
