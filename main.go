@@ -7430,18 +7430,37 @@ def load_model():
     model_id = os.environ.get("FLUX_MODEL", "black-forest-labs/FLUX.2-klein-4B")
     print(f"Loading {model_id}...")
     dtype = torch.bfloat16
+
+    # Try loading with all components first, then fallback for Klein/distilled variants
+    # that don't include text_encoder_2, tokenizer_2, image_encoder, feature_extractor
+    def _load(extra_kwargs=None):
+        kwargs = {"torch_dtype": dtype}
+        if extra_kwargs:
+            kwargs.update(extra_kwargs)
+        return FluxPipeline.from_pretrained(model_id, **kwargs)
+
     use_fp8 = os.environ.get("FLUX_FP8", "0") == "1"
-    if use_fp8:
-        try:
-            from torchao.quantization import float8_weight_only, quantize_
-            pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=dtype)
-            quantize_(pipe.transformer, float8_weight_only())
-            print("Using FP8 quantization")
-        except ImportError:
-            print("torchao not available, using bfloat16")
-            pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=dtype)
-    else:
-        pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    try:
+        if use_fp8:
+            try:
+                from torchao.quantization import float8_weight_only, quantize_
+                pipe = _load()
+                quantize_(pipe.transformer, float8_weight_only())
+                print("Using FP8 quantization")
+            except ImportError:
+                print("torchao not available, using bfloat16")
+                pipe = _load()
+        else:
+            pipe = _load()
+    except Exception as e:
+        print(f"Full pipeline load failed ({e}), trying without optional components...")
+        optional_none = {
+            "text_encoder_2": None, "tokenizer_2": None,
+            "image_encoder": None, "feature_extractor": None,
+        }
+        pipe = _load(optional_none)
+        print("Loaded with optional components disabled")
+
     pipe = pipe.to("cuda")
     pipe.set_progress_bar_config(disable=True)
     model_loaded = True
