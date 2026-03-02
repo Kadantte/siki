@@ -3119,13 +3119,15 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 	prompt := fmt.Sprintf(`あなたはタスク分解の専門家。ユーザーの複雑なリクエストを実行可能なステップに分解せよ。
 
 ## 利用可能なツール
-- web_search: インターネット検索
-- web_fetch: URL内容取得
-- run_code: HTML/JS/Canvas実行
-- diagram: Graphviz図生成
-- execute_command: シェルコマンド
+- web_search: インターネット検索。引数不要（実行時に自動設定）
+- web_fetch: URL内容取得。引数不要（前のタスク結果から自動抽出）
+- run_code: HTML/JS/Canvas実行（ゲーム・シミュレーション・インタラクティブ可視化）
+- diagram: Graphviz図生成（構成図・関係図・フロー図）
+- generate_image: AI画像生成（インフォグラフィック・イラスト・コンセプトアート・写真風画像）。Flux Klein 4Bモデルで高品質画像を生成。
+- execute_command: シェルコマンド実行
 - read_file: ファイル読込
 - write_file: ファイル書込
+- summarize: 中間まとめ（ツール呼び出しなし）
 
 ## 会話履歴
 %s
@@ -3137,8 +3139,7 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 以下のJSONのみ出力せよ（他の文章は書くな）:
 {"tasks": [
   {"id": 1, "description": "タスクの説明", "tool": "使うツール名"},
-  {"id": 2, "description": "タスクの説明", "tool": "使うツール名"},
-  ...
+  {"id": 2, "description": "タスクの説明", "tool": "使うツール名"}
 ]}
 
 ## ルール
@@ -3147,7 +3148,9 @@ func createPlan(userMsg string, messages []Message, config *Config) (*Plan, erro
 - 3〜10個のタスクに分解しろ
 - 各タスクの説明は具体的にしろ（何を検索するか、何を実行するか）
 - ツール不要の中間ステップ（まとめ・分析）には tool を "summarize" にしろ
-- generate_image: AI画像生成（インフォグラフィック、イラスト等）も利用可能`, ctx.String(), userMsg)
+- 「インフォグラフィック」「図にして」「画像」「イラスト」等のビジュアル出力要求がある場合、最終タスクに generate_image を必ず含めろ
+- generate_image はテキストプロンプトからAI画像を生成する。run_code（HTML）やdiagram（Graphviz）とは別物
+- 調査→まとめ→画像生成 の流れが自然`, ctx.String(), userMsg)
 
 	// Use sub-agent for plan creation if available (better at complex decomposition)
 	var response string
@@ -3255,6 +3258,7 @@ func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, s
 - web_searchの場合、具体的な検索クエリを指定
 - run_codeの場合、完全なHTMLを生成
 - execute_commandの場合、具体的なコマンドを指定
+- generate_imageの場合、英語で詳細な画像プロンプトを {"tool":"generate_image","args":{"prompt":"..."}} で指定
 - summarize の場合は {"tool":"none","response":"まとめテキスト"} を返せ`,
 		ctx.String(), task.ID, task.Description, task.Tool)
 
@@ -3464,6 +3468,47 @@ func executePlanTask(task *PlanTask, plan *Plan, agent *Agent, config *Config, s
 		if len(html) < 100 {
 			if newHTML, err := generateCodeWithSubModel(task.Description, config); err == nil {
 				args["html"] = newHTML
+			}
+		}
+	}
+
+	// For generate_image: build English prompt from previous task results
+	if toolName == "generate_image" {
+		prompt, _ := args["prompt"].(string)
+		if prompt == "" || len(prompt) < 20 {
+			// Collect all previous task results as context
+			var prevData strings.Builder
+			for _, t := range plan.Tasks {
+				if t.Status == "completed" && t.Result != "" {
+					r := t.Result
+					if len(r) > 2000 {
+						r = r[:2000] + "..."
+					}
+					prevData.WriteString(fmt.Sprintf("## %s\n%s\n\n", t.Description, r))
+				}
+			}
+			imgPromptReq := fmt.Sprintf(`以下の調査結果をもとに、インフォグラフィック画像を生成するための英語プロンプトを作成せよ。
+プロンプトのみ出力し、他の文章は書くな。
+スタイル: modern infographic, clean design, data visualization, professional, dark background
+
+目標: %s
+
+調査結果:
+%s`, plan.Goal, prevData.String())
+			_, imgPrompt, err := callSubAgent(imgPromptReq, config)
+			if err == nil && len(imgPrompt) > 10 {
+				imgPrompt = strings.TrimSpace(imgPrompt)
+				imgPrompt = strings.TrimPrefix(imgPrompt, "```")
+				imgPrompt = strings.TrimSuffix(imgPrompt, "```")
+				imgPrompt = strings.TrimSpace(imgPrompt)
+				if len(imgPrompt) > 2 && imgPrompt[0] == '"' && imgPrompt[len(imgPrompt)-1] == '"' {
+					imgPrompt = imgPrompt[1 : len(imgPrompt)-1]
+				}
+				args["prompt"] = imgPrompt
+				sendEvent(StreamEvent{Type: "thinking", Content: fmt.Sprintf("Image prompt: %s", imgPrompt)})
+			} else {
+				// Fallback: use task description directly
+				args["prompt"] = "Modern infographic about " + plan.Goal + ", data visualization, professional design, dark theme"
 			}
 		}
 	}
