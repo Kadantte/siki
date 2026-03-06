@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
 	"os"
 	"os/exec"
@@ -78,6 +79,9 @@ type Config struct {
 	ImageModel      string     `json:"image_model"`      // default: "black-forest-labs/FLUX.2-klein-4B"
 	ImageEndpoint   string     `json:"image_endpoint"`   // default: "http://localhost:8100"
 	ImageEnabled    bool       `json:"image_enabled"`    // default: true
+	VideoModel      string     `json:"video_model"`      // default: "BestWishYSH/Helios-Distilled"
+	VideoEndpoint   string     `json:"video_endpoint"`   // default: "http://localhost:8101"
+	VideoEnabled    bool       `json:"video_enabled"`    // default: true
 	// Email digest settings
 	EmailTo       string `json:"email_to"`
 	EmailFrom     string `json:"email_from"`
@@ -168,8 +172,10 @@ func defaultConfig() *Config {
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
-		SubModel:        "gpt-oss:latest",
+		SubModel:        "qwen3.5:latest",
 		SubModelBackend: "ollama",
+		Orchestrator:        "qwen3.5:latest",
+		OrchestratorBackend: "ollama",
 		ImageModel:   "black-forest-labs/FLUX.2-klein-4B",
 		ImageEndpoint: "http://localhost:8100",
 		ImageEnabled:  true,
@@ -762,6 +768,24 @@ var tools = []Tool{
 				"height": map[string]interface{}{
 					"type":        "integer",
 					"description": "Image height in pixels (256-1024, default 512)",
+				},
+			},
+			"required": []string{"prompt"},
+		},
+	},
+	{
+		Name:        "generate_video",
+		Description: "Generate a video using Helios AI model. Creates MP4 videos from text prompts. Use for animations, motion graphics, and video content. Prompts should be in English and detailed.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"prompt": map[string]interface{}{
+					"type":        "string",
+					"description": "Detailed English prompt describing the video to generate",
+				},
+				"num_frames": map[string]interface{}{
+					"type":        "integer",
+					"description": "Number of frames (multiples of 33, default 33 for ~1.4s, 99 for ~4s)",
 				},
 			},
 			"required": []string{"prompt"},
@@ -1388,6 +1412,20 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (result st
 			return "", err
 		}
 		return fmt.Sprintf("Image generated successfully: ![Generated Image](%s)\n\nURL: %s", urlPath, urlPath), nil
+	case "generate_video":
+		prompt, _ := args["prompt"].(string)
+		if prompt == "" {
+			return "", fmt.Errorf("prompt is required for generate_video")
+		}
+		numFrames := 33
+		if nf, ok := args["num_frames"].(float64); ok && nf > 0 {
+			numFrames = int(nf)
+		}
+		urlPath, err := generateVideo(prompt, numFrames, a.config)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Video generated successfully: [Generated Video](%s)\n\nURL: %s\n\n<video src=\"%s\" controls autoplay loop style=\"max-width:100%%\"></video>", urlPath, urlPath, urlPath), nil
 	case "create_plugin":
 		return a.createPlugin(args)
 	case "list_plugins":
@@ -1970,12 +2008,9 @@ func (a *Agent) webSearch(query string) (string, error) {
 		}
 	}
 
-	// Build search URL with date filter for time-sensitive queries
 	now := time.Now()
 	searchQuery := query
-	dateFilter := ""
 	if isTimeSensitive {
-		// Append year+month to bias results toward current time
 		hasYear := false
 		for y := now.Year() - 1; y <= now.Year(); y++ {
 			if strings.Contains(query, fmt.Sprintf("%d", y)) {
@@ -1986,10 +2021,42 @@ func (a *Agent) webSearch(query string) (string, error) {
 		if !hasYear {
 			searchQuery = fmt.Sprintf("%s %d年%d月", query, now.Year(), int(now.Month()))
 		}
-		dateFilter = "&df=m" // DuckDuckGo: filter to past month
 	}
 
-	// Use DuckDuckGo HTML search
+	// Try Scrapling first
+	scrapResults, err := scraplingSearch(searchQuery, 10)
+	if err == nil && len(scrapResults) > 0 {
+		var results []string
+		for _, r := range scrapResults {
+			title := r["title"]
+			resultURL := r["url"]
+			snippet := r["snippet"]
+			shortURL := resultURL
+			if idx := strings.Index(resultURL, "://"); idx >= 0 {
+				shortURL = resultURL[idx+3:]
+				if slashIdx := strings.Index(shortURL, "/"); slashIdx >= 0 {
+					shortURL = shortURL[:slashIdx]
+				}
+			}
+			if len(shortURL) > 15 {
+				shortURL = shortURL[:12] + "..."
+			}
+			result := fmt.Sprintf("**%s**\n[%s](%s)\n%s\n", title, shortURL, resultURL, snippet)
+			results = append(results, result)
+		}
+		header := fmt.Sprintf("Search results for: %s", query)
+		if searchQuery != query {
+			header += fmt.Sprintf(" (searched: %s)", searchQuery)
+		}
+		return fmt.Sprintf("%s\n\n%s", header, strings.Join(results, "\n---\n")), nil
+	}
+	fmt.Printf("[siki] webSearch: scrapling failed (%v), falling back to Go\n", err)
+
+	// Fallback: direct Go HTTP with DuckDuckGo
+	dateFilter := ""
+	if isTimeSensitive {
+		dateFilter = "&df=m"
+	}
 	encodedQuery := url.QueryEscape(searchQuery)
 	searchURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s%s", encodedQuery, dateFilter)
 
@@ -2011,19 +2078,13 @@ func (a *Agent) webSearch(query string) (string, error) {
 		return "", err
 	}
 
-	// Parse search results from HTML
 	html := string(body)
 	var results []string
-
-	// Extract result snippets (simple parsing)
-	// Look for result links and snippets
 	parts := strings.Split(html, "result__a")
 	for i, part := range parts {
 		if i == 0 || i > 10 {
 			continue
 		}
-
-		// Extract URL
 		urlStart := strings.Index(part, "href=\"")
 		if urlStart == -1 {
 			continue
@@ -2033,25 +2094,20 @@ func (a *Agent) webSearch(query string) (string, error) {
 		if urlEnd == -1 {
 			continue
 		}
-		url := part[urlStart : urlStart+urlEnd]
-
-		// Clean up DuckDuckGo redirect URL
-		if strings.Contains(url, "uddg=") {
-			if idx := strings.Index(url, "uddg="); idx != -1 {
-				url = url[idx+5:]
-				if ampIdx := strings.Index(url, "&"); ampIdx != -1 {
-					url = url[:ampIdx]
+		resultURL := part[urlStart : urlStart+urlEnd]
+		if strings.Contains(resultURL, "uddg=") {
+			if idx := strings.Index(resultURL, "uddg="); idx != -1 {
+				resultURL = resultURL[idx+5:]
+				if ampIdx := strings.Index(resultURL, "&"); ampIdx != -1 {
+					resultURL = resultURL[:ampIdx]
 				}
-				// URL decode
-				url = strings.ReplaceAll(url, "%3A", ":")
-				url = strings.ReplaceAll(url, "%2F", "/")
-				url = strings.ReplaceAll(url, "%3F", "?")
-				url = strings.ReplaceAll(url, "%3D", "=")
-				url = strings.ReplaceAll(url, "%26", "&")
+				resultURL = strings.ReplaceAll(resultURL, "%3A", ":")
+				resultURL = strings.ReplaceAll(resultURL, "%2F", "/")
+				resultURL = strings.ReplaceAll(resultURL, "%3F", "?")
+				resultURL = strings.ReplaceAll(resultURL, "%3D", "=")
+				resultURL = strings.ReplaceAll(resultURL, "%26", "&")
 			}
 		}
-
-		// Extract title
 		titleStart := strings.Index(part, ">")
 		if titleStart == -1 {
 			continue
@@ -2062,8 +2118,6 @@ func (a *Agent) webSearch(query string) (string, error) {
 		if titleEnd != -1 {
 			title = part[titleStart : titleStart+titleEnd]
 		}
-
-		// Extract snippet
 		snippetStart := strings.Index(part, "result__snippet")
 		snippet := ""
 		if snippetStart != -1 {
@@ -2077,16 +2131,12 @@ func (a *Agent) webSearch(query string) (string, error) {
 				}
 			}
 		}
-
-		// Clean HTML entities
 		title = cleanHTMLEntities(title)
 		snippet = cleanHTMLEntities(snippet)
-
-		if title != "" || url != "" {
-			// Short display: extract domain, truncate to ~10 chars
-			shortURL := url
-			if idx := strings.Index(url, "://"); idx >= 0 {
-				shortURL = url[idx+3:]
+		if title != "" || resultURL != "" {
+			shortURL := resultURL
+			if idx := strings.Index(resultURL, "://"); idx >= 0 {
+				shortURL = resultURL[idx+3:]
 				if slashIdx := strings.Index(shortURL, "/"); slashIdx >= 0 {
 					shortURL = shortURL[:slashIdx]
 				}
@@ -2094,15 +2144,13 @@ func (a *Agent) webSearch(query string) (string, error) {
 			if len(shortURL) > 15 {
 				shortURL = shortURL[:12] + "..."
 			}
-			result := fmt.Sprintf("**%s**\n[%s](%s)\n%s\n", title, shortURL, url, snippet)
+			result := fmt.Sprintf("**%s**\n[%s](%s)\n%s\n", title, shortURL, resultURL, snippet)
 			results = append(results, result)
 		}
 	}
-
 	if len(results) == 0 {
 		return "No search results found.", nil
 	}
-
 	header := fmt.Sprintf("Search results for: %s", query)
 	if searchQuery != query {
 		header += fmt.Sprintf(" (searched: %s)", searchQuery)
@@ -2128,6 +2176,15 @@ func (a *Agent) webFetchQuick(targetURL string) (string, error) {
 		targetURL = decoded
 	}
 	fmt.Printf("[siki] webFetchQuick: %s\n", targetURL)
+
+	// Try Scrapling first for better HTML parsing
+	_, text, _, err := scraplingFetch(targetURL, 5000, false)
+	if err == nil && len(text) > 0 {
+		return text, nil
+	}
+	fmt.Printf("[siki] webFetchQuick: scrapling failed (%v), falling back to Go\n", err)
+
+	// Fallback: direct Go HTTP
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
@@ -2141,23 +2198,36 @@ func (a *Agent) webFetchQuick(targetURL string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Read max 100KB to avoid slow transfers
 	limited := io.LimitReader(resp.Body, 100*1024)
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		return "", err
 	}
 
-	text := extractTextFromHTML(string(body))
-	if len(text) > 5000 {
-		text = text[:5000]
+	goText := extractTextFromHTML(string(body))
+	if len(goText) > 5000 {
+		goText = goText[:5000]
 	}
-	return text, nil
+	return goText, nil
 }
 
-func (a *Agent) webFetch(url string) (string, error) {
+func (a *Agent) webFetch(targetURL string) (string, error) {
+	fmt.Printf("[siki] webFetch: %s\n", targetURL)
+
+	// Try Scrapling first
+	title, text, _, err := scraplingFetch(targetURL, 15000, false)
+	if err == nil && len(text) > 0 {
+		header := fmt.Sprintf("Content from %s", targetURL)
+		if title != "" {
+			header = fmt.Sprintf("%s (%s)", title, targetURL)
+		}
+		return fmt.Sprintf("%s:\n\n%s", header, text), nil
+	}
+	fmt.Printf("[siki] webFetch: scrapling failed (%v), falling back to Go\n", err)
+
+	// Fallback: direct Go HTTP
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -2174,16 +2244,13 @@ func (a *Agent) webFetch(url string) (string, error) {
 		return "", err
 	}
 
-	// Extract text content from HTML
 	html := string(body)
-	text := extractTextFromHTML(html)
-
-	// Truncate if too long
-	if len(text) > 15000 {
-		text = text[:15000] + "\n\n... (truncated)"
+	goText := extractTextFromHTML(html)
+	if len(goText) > 15000 {
+		goText = goText[:15000] + "\n\n... (truncated)"
 	}
 
-	return fmt.Sprintf("Content from %s:\n\n%s", url, text), nil
+	return fmt.Sprintf("Content from %s:\n\n%s", targetURL, goText), nil
 }
 
 func (a *Agent) blogPersonSearch(blogURL string, maxArticles int) (string, error) {
@@ -2974,19 +3041,51 @@ func streamVLLMGenerate(model, prompt string, maxTokens int, timeout time.Durati
 	return fullResponse.String(), nil
 }
 
-// callSubModel calls a lightweight sub-model (e.g. lfm2.5-thinking) via Ollama or vllm.
-// It handles <think></think> tag extraction, returning (thinking, response).
-// Used for fast tasks like reflection, summarization, and document tree search.
+// alternateSubModels returns the two sub-models available for retry alternation.
+// Primary is config.SubModel (qwen3.5), secondary is gpt-oss.
+func alternateSubModels(config *Config) (primary, secondary string) {
+	primary = config.SubModel
+	if primary == "" {
+		primary = "qwen3.5:latest"
+	}
+	secondary = "gpt-oss:latest"
+	if primary == secondary {
+		secondary = "qwen3.5:latest"
+	}
+	return
+}
+
+// pickRetryModel picks a model for retry, alternating between qwen3.5 and gpt-oss.
+// attemptNum 0 = primary model (already tried), 1+ = alternate.
+func pickRetryModel(config *Config, attemptNum int) string {
+	primary, secondary := alternateSubModels(config)
+	if attemptNum%2 == 0 {
+		return primary
+	}
+	return secondary
+}
+
+// callSubModel calls the configured sub-model via Ollama or vllm.
 func callSubModel(prompt string, config *Config) (thinking string, response string, err error) {
-	if config.SubModel == "" {
+	return callSubModelWith(prompt, config, "")
+}
+
+// callSubModelWith calls a specific model (or default sub-model if modelOverride is empty).
+// It handles <think></think> tag extraction, returning (thinking, response).
+func callSubModelWith(prompt string, config *Config, modelOverride string) (thinking string, response string, err error) {
+	model := config.SubModel
+	if modelOverride != "" {
+		model = modelOverride
+	}
+	if model == "" {
 		return "", "", fmt.Errorf("no sub-model configured")
 	}
 
 	endpoint := subModelEndpoint(config)
 
 	// Use vllm (OpenAI-compatible) API if configured
-	if isSubModelVLLM(config) {
-		content, err := callVLLMGenerate(config.SubModel, prompt, 32768, 120*time.Second, endpoint)
+	if modelOverride == "" && isSubModelVLLM(config) {
+		content, err := callVLLMGenerate(model, prompt, 32768, 120*time.Second, endpoint)
 		if err != nil {
 			return "", "", err
 		}
@@ -2995,7 +3094,7 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 
 	// Ollama native API
 	reqBody := map[string]interface{}{
-		"model":      config.SubModel,
+		"model":      model,
 		"prompt":     prompt,
 		"stream":     false,
 		"keep_alive": -1,
@@ -4296,6 +4395,7 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - read_file: ファイル読込。引数: {"path": "ファイルパス"}
 - write_file: ファイル書込。引数: {"path": "パス", "content": "内容"}
 - generate_image: AI画像生成（Flux Klein 4B）。インフォグラフィック・イラスト・コンセプトアート。引数: {"prompt": "英語の詳細プロンプト"}
+- generate_video: AI動画生成（Helios）。アニメーション・モーション映像。引数: {"prompt": "英語の詳細プロンプト", "num_frames": 33}
 - search_threads: 過去の全スレッド横断で会話ログを検索。引数: {"query": "検索キーワード"}
 - search_conversation: 現在のスレッド内の会話を検索。引数: {"query": "検索キーワード"}
 - recall_context: 現スレッドの会話ログから文脈を思い出す。引数: {"query": "検索キーワード"}
@@ -4318,6 +4418,7 @@ func subModelOrchestrate(userMsg string, messages []Message, config *Config) (*O
 - 今日は%d年%d月%d日
 - run_codeはゲーム・シミュレーション・インタラクティブUI等のプログラム実行専用
 - generate_imageはインフォグラフィック・イラスト・ポスター等の画像生成専用（run_codeと混同するな）
+- generate_videoは動画・映像・アニメーション生成専用。「動画」「ビデオ」「映像」キーワードにはgenerate_videoを使え
 - web_searchの場合、適切な検索クエリを指定
 - 「過去の会話」「前に話した」「さっきの」「会話ログ」等の場合はsearch_threadsかrecall_contextを使え（web_searchではない）
 - 複数のツールを組み合わせる必要がある複雑なリクエスト（調査→分析→可視化など）には plan を使え
@@ -4484,7 +4585,11 @@ func containsConversationKeywords(msg string) bool {
 }
 
 // executeToolAndSummarize is a helper for retry: execute a tool and stream the summary.
-func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName string, sendEvent func(StreamEvent), saveMsg func(Message, string)) string {
+func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName string, sendEvent func(StreamEvent), saveMsg func(Message, string), modelOverride ...string) string {
+	retryModel := ""
+	if len(modelOverride) > 0 {
+		retryModel = modelOverride[0]
+	}
 	args := map[string]interface{}{}
 	if toolName == "web_search" {
 		args["query"] = userMsg
@@ -4597,8 +4702,12 @@ func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName str
 		}
 	}
 
-	sendEvent(modelThinkingEvent("再回答を生成中...", ws.config, hasSubAgent(ws.config)))
-	finalResponse, err := streamSubModelSummarize(userMsg, toolName, result, ws.config, sendEvent)
+	if retryModel != "" {
+		sendEvent(modelThinkingEvent(fmt.Sprintf("再回答を生成中（%s）...", retryModel), ws.config, hasSubAgent(ws.config)))
+	} else {
+		sendEvent(modelThinkingEvent("再回答を生成中...", ws.config, hasSubAgent(ws.config)))
+	}
+	finalResponse, err := streamSubModelSummarizeWith(userMsg, toolName, result, ws.config, sendEvent, retryModel)
 	if err != nil || finalResponse == "" {
 		return ""
 	}
@@ -4642,6 +4751,7 @@ func detectToolFromKeywords(userMsg string) string {
 	}
 	rules := []toolRule{
 		{[]string{"4コマ", "４コマ", "漫画", "マンガ", "コミック", "comic"}, "plan"},
+		{[]string{"動画生成", "動画を生成", "動画を作", "ビデオ生成", "ビデオを作", "映像生成", "映像を作", "video generat", "generate video", "アニメーション生成"}, "generate_video"},
 		{[]string{"画像生成", "イラスト描", "インフォグラフィック", "image generat", "generate image", "画像を生成", "画像を作"}, "generate_image"},
 		{[]string{"過去の会話", "会話ログ", "過去ログ", "前の会話", "さっきの会話", "会話履歴", "スレッド検索", "やり取り"}, "search_threads"},
 		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "web_search"},
@@ -4946,10 +5056,20 @@ func generateSuggestions(userMsg, response, toolName string) []string {
 
 // streamSubModelSummarize streams gpt-oss's summary response token-by-token via SSE.
 func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Config, sendEvent func(StreamEvent)) (string, error) {
+	return streamSubModelSummarizeWith(userMsg, toolName, toolResult, config, sendEvent, "")
+}
+
+// streamSubModelSummarizeWith is like streamSubModelSummarize but allows overriding the model.
+func streamSubModelSummarizeWith(userMsg, toolName, toolResult string, config *Config, sendEvent func(StreamEvent), modelOverride string) (string, error) {
+	model := config.SubModel
+	if modelOverride != "" {
+		model = modelOverride
+	}
+
 	result := toolResult
 	maxResult := 20000
 	if hasSubAgent(config) {
-		maxResult = 60000 // Sub-agent can handle larger context
+		maxResult = 60000
 	}
 	if len(result) > maxResult {
 		result = result[:maxResult] + "\n... (以下省略)"
@@ -4976,7 +5096,7 @@ func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Confi
 上記のツール結果のみに基づいて、日本語で詳しく回答せよ。`, userMsg, toolName, result)
 
 	// Use sub-agent for summarization if available (more powerful model)
-	if hasSubAgent(config) {
+	if modelOverride == "" && hasSubAgent(config) {
 		fmt.Printf("[siki] Using sub-agent (%s) for summarization\n", config.SubAgent)
 		return streamSubAgentGenerate(prompt, config, sendEvent)
 	}
@@ -4984,13 +5104,13 @@ func streamSubModelSummarize(userMsg, toolName, toolResult string, config *Confi
 	endpoint := subModelEndpoint(config)
 
 	// Use vllm (OpenAI-compatible) streaming API if configured
-	if isSubModelVLLM(config) {
-		return streamVLLMGenerate(config.SubModel, prompt, 32768, 300*time.Second, endpoint, sendEvent)
+	if modelOverride == "" && isSubModelVLLM(config) {
+		return streamVLLMGenerate(model, prompt, 32768, 300*time.Second, endpoint, sendEvent)
 	}
 
 	// Ollama native streaming API
 	reqBody := map[string]interface{}{
-		"model":      config.SubModel,
+		"model":      model,
 		"prompt":     prompt,
 		"stream":     true,
 		"keep_alive": -1,
@@ -5415,7 +5535,9 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 					}
 				}
 				sendEvent(modelThinkingEvent("回答を検証中...ツールで再確認します", ws.config, hasSubAgent(ws.config)))
-				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg)
+				altModel := pickRetryModel(ws.config, 1)
+				fmt.Printf("[siki] Retry #1 using alternate model: %s\n", altModel)
+				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg, altModel)
 				if retryResult != "" {
 					return retryResult
 				}
@@ -5424,10 +5546,12 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			isValid, reason, cleaned := validateResponse(userMsg, resp, "", ws.config)
 			if !isValid {
 				fmt.Printf("[siki] Direct answer validation failed: %s\n", reason)
-				// Try with a tool as fallback
+				// Try with a tool as fallback — use alternate model for retry
 				retryTool := "web_search"
+				altModel := pickRetryModel(ws.config, 2)
+				fmt.Printf("[siki] Retry #2 using alternate model: %s\n", altModel)
 				sendEvent(modelThinkingEvent(fmt.Sprintf("回答品質チェック不合格: %s — ツールで再検索します", reason), ws.config, hasSubAgent(ws.config)))
-				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg)
+				retryResult := ws.executeToolAndSummarize(agent, userMsg, retryTool, sendEvent, saveMsg, altModel)
 				if retryResult != "" {
 					return retryResult
 				}
@@ -5645,6 +5769,36 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 					}
 					args["prompt"] = enhanced
 					sendEvent(modelThinkingEvent(fmt.Sprintf("Prompt: %s", enhanced), ws.config, hasSubAgent(ws.config)))
+				} else {
+					args["prompt"] = userMsg
+				}
+			} else {
+				args["prompt"] = userMsg
+			}
+		}
+	}
+
+	// Generate video: ensure prompt exists, enhance if needed
+	if toolName == "generate_video" {
+		prompt, _ := args["prompt"].(string)
+		if prompt == "" {
+			if ws.config.SubModel != "" || hasSubAgent(ws.config) {
+				sendEvent(modelThinkingEvent("動画プロンプトを生成中...", ws.config, hasSubAgent(ws.config)))
+				enhanceReq := fmt.Sprintf(`以下のユーザーリクエストから、動画生成AI用の英語プロンプトを生成せよ。
+動きや場面の変化を含む詳細で描写的な英語プロンプトのみを出力し、他の文章は書くな。
+
+ユーザーリクエスト: %s`, userMsg)
+				_, enhanced, err := callSubAgent(enhanceReq, ws.config)
+				if err == nil && len(enhanced) > 10 {
+					enhanced = strings.TrimSpace(enhanced)
+					enhanced = strings.TrimPrefix(enhanced, "```")
+					enhanced = strings.TrimSuffix(enhanced, "```")
+					enhanced = strings.TrimSpace(enhanced)
+					if len(enhanced) > 2 && enhanced[0] == '"' && enhanced[len(enhanced)-1] == '"' {
+						enhanced = enhanced[1 : len(enhanced)-1]
+					}
+					args["prompt"] = enhanced
+					sendEvent(modelThinkingEvent(fmt.Sprintf("Video Prompt: %s", enhanced), ws.config, hasSubAgent(ws.config)))
 				} else {
 					args["prompt"] = userMsg
 				}
@@ -5903,6 +6057,18 @@ func preWarmSubModel(config *Config) {
 			fmt.Printf("[siki] Sub-model warm-up failed: %v\n", err)
 		} else {
 			fmt.Printf("[siki] Sub-model ready (%.1fs)\n", time.Since(start).Seconds())
+		}
+		// Also pre-warm orchestrator if different from sub-model
+		orchModel := config.orchestratorModel()
+		if orchModel != "" && orchModel != config.SubModel {
+			fmt.Printf("[siki] Pre-warming orchestrator: %s ...\n", orchModel)
+			start2 := time.Now()
+			_, err2 := callOllamaGenerate(orchModel, "Say OK.", 5, 600*time.Second, config)
+			if err2 != nil {
+				fmt.Printf("[siki] Orchestrator warm-up failed: %v\n", err2)
+			} else {
+				fmt.Printf("[siki] Orchestrator ready (%.1fs)\n", time.Since(start2).Seconds())
+			}
 		}
 	}()
 }
@@ -7883,23 +8049,75 @@ HTML本文のみ出力せよ。`, dateStr, now.Day(), now.Year(), truncateString
 	}
 	fmt.Printf("[siki] Digest: summary generated (%d bytes)\n", len(htmlBody))
 
-	// 6. Send email
+	// 6. Generate digest illustration image
+	var digestImages []EmailImage
+	if canRunImageServer() {
+		fmt.Println("[siki] Digest: generating illustration image...")
+		imgPrompt := fmt.Sprintf(`Generate a single English prompt for an illustration that visually represents today's tech news digest. The image should be a clean, modern infographic-style illustration. Topics: %s. Output only the English prompt, nothing else.`, truncateString(htmlBody, 500))
+		_, imgPromptEn, imgErr := callSubModel(imgPrompt, ws.config)
+		if imgErr == nil && len(imgPromptEn) > 10 {
+			imgPromptEn = strings.TrimSpace(imgPromptEn)
+			if len(imgPromptEn) > 300 {
+				imgPromptEn = imgPromptEn[:300]
+			}
+			fmt.Printf("[siki] Digest: image prompt: %s\n", truncateString(imgPromptEn, 100))
+			imgPath, imgErr2 := generateImage(imgPromptEn, 768, 512, ws.config)
+			if imgErr2 == nil {
+				fullPath := filepath.Join(".", imgPath) // imgPath is /playground/xxx.png
+				if strings.HasPrefix(imgPath, "/playground/") {
+					fullPath = filepath.Join(playgroundDir, filepath.Base(imgPath))
+				}
+				imgData, readErr := os.ReadFile(fullPath)
+				if readErr == nil {
+					digestImages = append(digestImages, EmailImage{
+						CID:      "digest-illustration",
+						Data:     imgData,
+						MimeType: "image/png",
+						Filename: filepath.Base(imgPath),
+					})
+					// Add image tag at the top of HTML body
+					htmlBody = fmt.Sprintf(`<div style="text-align:center;margin-bottom:20px"><img src="cid:digest-illustration" style="max-width:100%%;border-radius:8px" alt="Digest illustration"></div>`) + htmlBody
+					fmt.Println("[siki] Digest: illustration image attached")
+				} else {
+					fmt.Printf("[siki] Digest: failed to read image file: %v\n", readErr)
+				}
+			} else {
+				fmt.Printf("[siki] Digest: image generation failed: %v\n", imgErr2)
+			}
+		} else {
+			fmt.Printf("[siki] Digest: image prompt generation failed: %v\n", imgErr)
+		}
+	}
+
+	// 7. Send email
 	subject := fmt.Sprintf("siki ダイジェスト — %s", now.Format("2006/01/02 15:00"))
 	fmt.Printf("[siki] Digest: sending email to %s...\n", ws.config.EmailTo)
-	if err := sendEmail(ws.config, subject, htmlBody); err != nil {
+	if err := sendEmailWithImages(ws.config, subject, htmlBody, digestImages); err != nil {
 		fmt.Printf("[siki] Digest: email send failed: %v\n", err)
 		return
 	}
 	fmt.Printf("[siki] Digest: email sent to %s\n", ws.config.EmailTo)
 
-	// 7. Save digest as a thread
+	// 8. Save digest as a thread
 	digestThreadID := fmt.Sprintf("digest-%d", now.Unix())
 	digestMsg := Message{Role: "assistant", Content: fmt.Sprintf("# %s\n\n%s", subject, htmlBody)}
 	appendMessageToThread(digestThreadID, digestMsg, "")
 	saveThreadMeta(&Thread{ID: digestThreadID, Title: subject, CreatedAt: now, UpdatedAt: now, MessageCount: 1})
 }
 
+// EmailImage represents an inline image attachment for emails.
+type EmailImage struct {
+	CID      string // Content-ID (referenced in HTML as cid:xxx)
+	Data     []byte // Raw image bytes
+	MimeType string // e.g. "image/png"
+	Filename string
+}
+
 func sendEmail(config *Config, subject, htmlBody string) error {
+	return sendEmailWithImages(config, subject, htmlBody, nil)
+}
+
+func sendEmailWithImages(config *Config, subject, htmlBody string, images []EmailImage) error {
 	from := config.EmailFrom
 	if from == "" {
 		from = config.SMTPUser
@@ -7916,8 +8134,54 @@ func sendEmail(config *Config, subject, htmlBody string) error {
 		port = 587
 	}
 
-	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: =?UTF-8?B?%s?=\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n%s",
-		from, config.EmailTo, base64.StdEncoding.EncodeToString([]byte(subject)), htmlBody)
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "From: %s\r\n", from)
+	fmt.Fprintf(&buf, "To: %s\r\n", config.EmailTo)
+	fmt.Fprintf(&buf, "Subject: =?UTF-8?B?%s?=\r\n", base64.StdEncoding.EncodeToString([]byte(subject)))
+	fmt.Fprintf(&buf, "MIME-Version: 1.0\r\n")
+
+	if len(images) == 0 {
+		// Simple HTML email
+		fmt.Fprintf(&buf, "Content-Type: text/html; charset=UTF-8\r\n\r\n")
+		buf.WriteString(htmlBody)
+	} else {
+		// Multipart related email (HTML + inline images)
+		mw := multipart.NewWriter(&buf)
+		fmt.Fprintf(&buf, "Content-Type: multipart/related; boundary=%s\r\n\r\n", mw.Boundary())
+
+		// HTML part
+		htmlHeader := make(textproto.MIMEHeader)
+		htmlHeader.Set("Content-Type", "text/html; charset=UTF-8")
+		htmlHeader.Set("Content-Transfer-Encoding", "quoted-printable")
+		htmlPart, err := mw.CreatePart(htmlHeader)
+		if err != nil {
+			return fmt.Errorf("failed to create HTML part: %w", err)
+		}
+		htmlPart.Write([]byte(htmlBody))
+
+		// Image parts
+		for _, img := range images {
+			imgHeader := make(textproto.MIMEHeader)
+			imgHeader.Set("Content-Type", img.MimeType)
+			imgHeader.Set("Content-Transfer-Encoding", "base64")
+			imgHeader.Set("Content-ID", fmt.Sprintf("<%s>", img.CID))
+			imgHeader.Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", img.Filename))
+			imgPart, err := mw.CreatePart(imgHeader)
+			if err != nil {
+				continue
+			}
+			encoded := base64.StdEncoding.EncodeToString(img.Data)
+			// Write base64 in 76-char lines per RFC 2045
+			for i := 0; i < len(encoded); i += 76 {
+				end := i + 76
+				if end > len(encoded) {
+					end = len(encoded)
+				}
+				imgPart.Write([]byte(encoded[i:end] + "\r\n"))
+			}
+		}
+		mw.Close()
+	}
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 
@@ -7955,7 +8219,7 @@ func sendEmail(config *Config, subject, htmlBody string) error {
 	if err != nil {
 		return fmt.Errorf("SMTP DATA failed: %w", err)
 	}
-	_, err = w.Write([]byte(msg))
+	_, err = w.Write(buf.Bytes())
 	if err != nil {
 		return fmt.Errorf("SMTP write failed: %w", err)
 	}
@@ -9739,6 +10003,671 @@ func generateImage(prompt string, width, height int, config *Config) (string, er
 	filePath := filepath.Join(playgroundDir, filename)
 	if err := os.WriteFile(filePath, imgData, 0644); err != nil {
 		return "", fmt.Errorf("failed to save image: %w", err)
+	}
+
+	urlPath := "/playground/" + filename
+	return urlPath, nil
+}
+
+// ============================================================================
+// Helios Video Generation Server Management
+// ============================================================================
+
+const videoServerScript = `#!/usr/bin/env python3
+"""Helios Video Generation Server for siki"""
+import os, sys, base64, json, time
+
+# Ensure all dependencies
+def ensure_deps():
+    deps = {
+        "fastapi": "fastapi",
+        "uvicorn": "uvicorn[standard]",
+        "pydantic": "pydantic",
+        "ftfy": "ftfy",
+        "imageio": "imageio",
+    }
+    missing = []
+    for mod, pkg in deps.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"Installing: {missing}")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing + ["--quiet"])
+    # Ensure imageio-ffmpeg separately (hyphen in name)
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "imageio-ffmpeg", "--quiet"])
+
+ensure_deps()
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+
+pipe = None
+model_loaded = False
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    num_frames: int = 33
+    height: int = 384
+    width: int = 640
+    seed: int = 42
+
+app = FastAPI()
+
+def ensure_diffusers_latest():
+    """Ensure diffusers has HeliosPyramidPipeline (requires latest source)."""
+    try:
+        from diffusers import HeliosPyramidPipeline
+        print("HeliosPyramidPipeline available")
+    except ImportError:
+        print("HeliosPyramidPipeline not available, upgrading diffusers from source...")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+            "--force-reinstall", "--no-deps",
+            "git+https://github.com/huggingface/diffusers.git", "--quiet"])
+        print("diffusers updated from source")
+
+def free_vram_for_video():
+    """Unload ollama models to free VRAM for video generation."""
+    import urllib.request
+    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    try:
+        for model in ["gpt-oss:latest", "qwen3.5:latest"]:
+            data = json.dumps({"model": model, "keep_alive": 0}).encode()
+            req = urllib.request.Request(f"{ollama_url}/api/generate", data=data,
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+        print("Ollama models unloaded to free VRAM")
+        time.sleep(2)
+    except Exception as e:
+        print(f"Warning: could not unload ollama models: {e}")
+
+def load_model():
+    global pipe, model_loaded
+    if model_loaded:
+        return
+    ensure_diffusers_latest()
+    free_vram_for_video()
+    import torch
+    from diffusers import HeliosPyramidPipeline
+    model_id = os.environ.get("VIDEO_MODEL", "BestWishYSH/Helios-Distilled")
+    print(f"Loading video model {model_id}...")
+
+    pipe = HeliosPyramidPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    pipe = pipe.to("cuda")
+
+    model_loaded = True
+    print(f"Video model loaded: {model_id}")
+
+@app.get("/health")
+async def health():
+    return {"status": "ready" if model_loaded else "loading", "model_loaded": model_loaded}
+
+@app.post("/generate")
+async def generate(req: GenerateRequest):
+    if not model_loaded:
+        try:
+            load_model()
+        except Exception as e:
+            return JSONResponse(status_code=503, content={"error": f"Model not loaded: {e}"})
+    try:
+        import torch
+        from diffusers.utils import export_to_video
+
+        # Round num_frames to nearest multiple of 33
+        nf = max(33, ((req.num_frames + 16) // 33) * 33)
+        print(f"Generating video: {req.prompt[:80]}... frames={nf}")
+
+        output = pipe(
+            prompt=req.prompt,
+            height=req.height,
+            width=req.width,
+            num_frames=nf,
+            generator=torch.Generator("cuda").manual_seed(req.seed),
+        )
+
+        # Save to temp file
+        output_dir = os.environ.get("VIDEO_OUTPUT_DIR", "/tmp")
+        ts = int(time.time() * 1000)
+        output_path = os.path.join(output_dir, f"video_{ts}.mp4")
+        export_to_video(output.frames[0], output_path, fps=24)
+
+        # Read and base64 encode
+        with open(output_path, "rb") as f:
+            video_b64 = base64.b64encode(f.read()).decode("utf-8")
+        os.remove(output_path)
+
+        return {"video_base64": video_b64, "num_frames": nf, "fps": 24}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/load")
+async def load():
+    try:
+        load_model()
+        return {"status": "loaded"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("VIDEO_PORT", "8101"))
+    if "--preload" in sys.argv:
+        load_model()
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+`
+
+// ============================================================================
+// Scrapling Web Fetch Server
+// ============================================================================
+
+const scraplingServerScript = `#!/usr/bin/env python3
+"""Scrapling-based web fetch server for siki"""
+import os, sys, json
+
+def ensure_deps():
+    deps = {"fastapi": "fastapi", "uvicorn": "uvicorn[standard]", "pydantic": "pydantic", "scrapling": "scrapling[all]", "curl_cffi": "curl_cffi"}
+    missing = []
+    for mod, pkg in deps.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        import subprocess
+        print(f"Installing: {missing}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing + ["--quiet"])
+
+ensure_deps()
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+
+app = FastAPI()
+
+class FetchRequest(BaseModel):
+    url: str
+    max_length: int = 15000
+    stealth: bool = False
+
+class SearchRequest(BaseModel):
+    query: str
+    max_results: int = 10
+
+@app.get("/health")
+async def health():
+    return {"status": "ready"}
+
+@app.post("/fetch")
+async def fetch(req: FetchRequest):
+    try:
+        if req.stealth:
+            from scrapling.fetchers import StealthyFetcher
+            page = StealthyFetcher.fetch(req.url, headless=True, timeout=20)
+        else:
+            from scrapling.fetchers import Fetcher
+            page = Fetcher.get(req.url, timeout=20)
+
+        title = ""
+        title_els = page.css("title")
+        if title_els:
+            title = title_els[0].text
+
+        # Try article/main content first, fallback to body
+        text = ""
+        for selector in ["article", "main", "[role=main]", ".post-content", ".entry-content", ".article-body"]:
+            els = page.css(selector)
+            if els:
+                t = els[0].get_all_text()
+                if len(t) > 100:
+                    text = t
+                    break
+        if not text:
+            body_els = page.css("body")
+            if body_els:
+                text = body_els[0].get_all_text()
+
+        # Clean up: collapse blank lines
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        text = "\n".join(lines)
+
+        if len(text) > req.max_length:
+            text = text[:req.max_length] + "\n\n... (truncated)"
+
+        # Extract links
+        links = []
+        for a in page.css("a")[:30]:
+            href = a.attrib.get("href", "")
+            link_text = a.text.strip() if a.text else ""
+            if href and link_text and href.startswith("http"):
+                links.append({"text": link_text[:100], "url": href})
+            if len(links) >= 20:
+                break
+
+        return {"title": title, "text": text, "links": links, "url": req.url}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/search")
+async def search(req: SearchRequest):
+    try:
+        from scrapling.fetchers import Fetcher
+        import urllib.parse
+
+        encoded = urllib.parse.quote_plus(req.query)
+        search_url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        page = Fetcher.get(search_url, timeout=20)
+
+        results = []
+        for item in page.css(".result"):
+            title_els = item.css(".result__a")
+            snippet_els = item.css(".result__snippet")
+            if not title_els:
+                continue
+
+            title = title_els[0].text.strip() if title_els[0].text else ""
+            url = title_els[0].attrib.get("href", "")
+
+            # Resolve DuckDuckGo redirect
+            if "uddg=" in url:
+                import re
+                m = re.search(r"uddg=([^&]+)", url)
+                if m:
+                    url = urllib.parse.unquote(m.group(1))
+
+            snippet = snippet_els[0].get_all_text().strip() if snippet_els else ""
+            if title and url:
+                results.append({"title": title, "url": url, "snippet": snippet})
+            if len(results) >= req.max_results:
+                break
+
+        return {"query": req.query, "results": results}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("SCRAPLING_PORT", "8102"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+`
+
+var (
+	scraplingServerProcess *exec.Cmd
+	scraplingServerReady   bool
+	scraplingServerMu      sync.Mutex
+	scraplingServerDir     string
+	scraplingEndpoint      = "http://localhost:8102"
+)
+
+func initScraplingServerDir() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	scraplingServerDir = filepath.Join(home, ".siki", "scrapling_server")
+	if err := os.MkdirAll(scraplingServerDir, 0755); err != nil {
+		return err
+	}
+	scriptPath := filepath.Join(scraplingServerDir, "server.py")
+	return os.WriteFile(scriptPath, []byte(scraplingServerScript), 0644)
+}
+
+func startScraplingServer() error {
+	scraplingServerMu.Lock()
+	defer scraplingServerMu.Unlock()
+
+	if scraplingServerReady {
+		return nil
+	}
+
+	if err := initScraplingServerDir(); err != nil {
+		return fmt.Errorf("failed to init scrapling server dir: %w", err)
+	}
+
+	scriptPath := filepath.Join(scraplingServerDir, "server.py")
+
+	// Find python3 (no CUDA needed for scrapling)
+	pythonPath := "python3"
+	home, _ := os.UserHomeDir()
+	// Prefer existing venv that likely has pip packages
+	venvPython := filepath.Join(home, "knowledgeCore", "venv", "bin", "python3")
+	if _, serr := os.Stat(venvPython); serr == nil {
+		pythonPath = venvPython
+	}
+
+	fmt.Printf("[siki] Starting scrapling server with %s...\n", pythonPath)
+	cmd := exec.Command(pythonPath, scriptPath)
+	cmd.Env = append(os.Environ(), "SCRAPLING_PORT=8102")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start scrapling server: %w", err)
+	}
+	scraplingServerProcess = cmd
+
+	// Wait for server to be ready
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(1 * time.Second)
+		resp, err := client.Get(scraplingEndpoint + "/health")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				scraplingServerReady = true
+				fmt.Println("[siki] Scrapling server ready")
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("scrapling server startup timeout")
+}
+
+func ensureScraplingServer() error {
+	if scraplingServerReady {
+		// Quick health check
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(scraplingEndpoint + "/health")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return nil
+			}
+		}
+		scraplingServerReady = false
+	}
+	return startScraplingServer()
+}
+
+func stopScraplingServer() {
+	scraplingServerMu.Lock()
+	defer scraplingServerMu.Unlock()
+	if scraplingServerProcess != nil && scraplingServerProcess.Process != nil {
+		scraplingServerProcess.Process.Kill()
+		scraplingServerProcess = nil
+	}
+	scraplingServerReady = false
+}
+
+// scraplingFetch fetches a URL using the Scrapling server, returns extracted text.
+func scraplingFetch(targetURL string, maxLength int, stealth bool) (string, string, []map[string]string, error) {
+	if err := ensureScraplingServer(); err != nil {
+		return "", "", nil, err
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"url":        targetURL,
+		"max_length": maxLength,
+		"stealth":    stealth,
+	})
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(scraplingEndpoint+"/fetch", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", "", nil, fmt.Errorf("scrapling fetch failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", "", nil, fmt.Errorf("scrapling fetch error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Title string              `json:"title"`
+		Text  string              `json:"text"`
+		Links []map[string]string `json:"links"`
+		URL   string              `json:"url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", nil, err
+	}
+	return result.Title, result.Text, result.Links, nil
+}
+
+// scraplingSearch performs a web search using the Scrapling server.
+func scraplingSearch(query string, maxResults int) ([]map[string]string, error) {
+	if err := ensureScraplingServer(); err != nil {
+		return nil, err
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"query":       query,
+		"max_results": maxResults,
+	})
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(scraplingEndpoint+"/search", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("scrapling search failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("scrapling search error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Query   string              `json:"query"`
+		Results []map[string]string `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result.Results, nil
+}
+
+// ============================================================================
+// Helios Video Generation Server Management
+// ============================================================================
+
+var (
+	videoServerProcess *exec.Cmd
+	videoServerReady   bool
+	videoServerMu      sync.Mutex
+	videoServerDir     string
+)
+
+func initVideoServerDir() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	videoServerDir = filepath.Join(home, ".siki", "video_server")
+	if err := os.MkdirAll(videoServerDir, 0755); err != nil {
+		return err
+	}
+	scriptPath := filepath.Join(videoServerDir, "server.py")
+	return os.WriteFile(scriptPath, []byte(videoServerScript), 0644)
+}
+
+func startVideoServer(config *Config) error {
+	videoServerMu.Lock()
+	defer videoServerMu.Unlock()
+
+	if videoServerReady {
+		return nil
+	}
+
+	if err := initVideoServerDir(); err != nil {
+		return fmt.Errorf("failed to init video server dir: %w", err)
+	}
+
+	scriptPath := filepath.Join(videoServerDir, "server.py")
+	endpoint := config.VideoEndpoint
+	if endpoint == "" {
+		endpoint = "http://localhost:8101"
+	}
+	port := "8101"
+	if idx := strings.LastIndex(endpoint, ":"); idx >= 0 {
+		port = endpoint[idx+1:]
+	}
+
+	modelName := config.VideoModel
+	if modelName == "" {
+		modelName = "BestWishYSH/Helios-Distilled"
+	}
+
+	// Find Python with CUDA torch + diffusers
+	pythonPath := "python3"
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, "knowledgeCore", "venv", "bin", "python3"),
+		filepath.Join(home, ".egox_venv", "bin", "python"),
+	}
+	for _, cand := range candidates {
+		if _, serr := os.Stat(cand); serr == nil {
+			checkCmd := exec.Command(cand, "-c", "import torch, diffusers; assert torch.cuda.is_available()")
+			if err := checkCmd.Run(); err == nil {
+				pythonPath = cand
+				fmt.Printf("[siki] Video server using Python: %s\n", pythonPath)
+				break
+			}
+		}
+	}
+
+	cmd := exec.Command(pythonPath, scriptPath)
+	cmd.Env = append(os.Environ(),
+		"VIDEO_PORT="+port,
+		"VIDEO_MODEL="+modelName,
+		"VIDEO_OUTPUT_DIR="+playgroundDir,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	fmt.Printf("[siki] Starting Helios video server on port %s...\n", port)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start video server: %w", err)
+	}
+	videoServerProcess = cmd
+
+	// Poll for health with timeout (video model takes longer to load)
+	healthURL := endpoint + "/health"
+	deadline := time.Now().Add(300 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(3 * time.Second)
+		resp, err := http.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				videoServerReady = true
+				fmt.Println("[siki] Video server is ready")
+				return nil
+			}
+		}
+	}
+
+	stopVideoServer()
+	return fmt.Errorf("video server failed to start within 300 seconds")
+}
+
+func ensureVideoServer(config *Config) error {
+	if videoServerReady {
+		return nil
+	}
+
+	endpoint := config.VideoEndpoint
+	if endpoint == "" {
+		endpoint = "http://localhost:8101"
+	}
+	resp, err := http.Get(endpoint + "/health")
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			videoServerReady = true
+			return nil
+		}
+	}
+
+	fmt.Println("[siki] Starting Helios video server (first use, this may take a while)...")
+	return startVideoServer(config)
+}
+
+func stopVideoServer() {
+	videoServerMu.Lock()
+	defer videoServerMu.Unlock()
+
+	if videoServerProcess == nil {
+		return
+	}
+
+	fmt.Println("[siki] Stopping video server...")
+	if videoServerProcess.Process != nil {
+		syscall.Kill(-videoServerProcess.Process.Pid, syscall.SIGTERM)
+		done := make(chan error, 1)
+		go func() { done <- videoServerProcess.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			syscall.Kill(-videoServerProcess.Process.Pid, syscall.SIGKILL)
+			<-done
+		}
+	}
+	videoServerProcess = nil
+	videoServerReady = false
+}
+
+func generateVideo(prompt string, numFrames int, config *Config) (string, error) {
+	if err := ensureVideoServer(config); err != nil {
+		return "", fmt.Errorf("video server not available: %w", err)
+	}
+
+	endpoint := config.VideoEndpoint
+	if endpoint == "" {
+		endpoint = "http://localhost:8101"
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"prompt":     prompt,
+		"num_frames": numFrames,
+	})
+
+	client := &http.Client{Timeout: 600 * time.Second} // Video generation can be slow
+	resp, err := client.Post(endpoint+"/generate", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("video generation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("video generation failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		VideoBase64 string `json:"video_base64"`
+		NumFrames   int    `json:"num_frames"`
+		FPS         int    `json:"fps"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode video response: %w", err)
+	}
+
+	videoData, err := base64.StdEncoding.DecodeString(result.VideoBase64)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode video base64: %w", err)
+	}
+
+	filename := fmt.Sprintf("video_%d.mp4", time.Now().UnixNano())
+	filePath := filepath.Join(playgroundDir, filename)
+	if err := os.WriteFile(filePath, videoData, 0644); err != nil {
+		return "", fmt.Errorf("failed to save video: %w", err)
 	}
 
 	urlPath := "/playground/" + filename
@@ -12010,6 +12939,8 @@ func (ws *WebServer) handlePlayground(w http.ResponseWriter, r *http.Request) {
 		".jpeg": "image/jpeg",
 		".gif":  "image/gif",
 		".svg":  "image/svg+xml",
+		".mp4":  "video/mp4",
+		".webm": "video/webm",
 	}
 	contentType, ok := allowedExts[ext]
 	if !ok {
@@ -13412,6 +14343,8 @@ func runWeb(config *Config, host string, port int) error {
 		<-sigCh
 		fmt.Println("\nShutting down...")
 		stopImageServer()
+		stopVideoServer()
+		stopScraplingServer()
 		stopDockerContainer()
 		server.Close()
 	}()
@@ -13467,6 +14400,8 @@ func runChat(config *Config) error {
 		<-sigCh
 		fmt.Println("\nGoodbye!")
 		stopImageServer()
+		stopVideoServer()
+		stopScraplingServer()
 		stopDockerContainer()
 		cancel()
 		os.Exit(0)
@@ -13519,7 +14454,7 @@ func runChat(config *Config) error {
 func main() {
 	config := defaultConfig()
 	webPort := 3000
-	webHost := "127.0.0.1"
+	webHost := "0.0.0.0"
 
 	// Parse command line arguments
 	args := os.Args[1:]
