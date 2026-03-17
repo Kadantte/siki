@@ -9,6 +9,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
 	"crypto/tls"
 	"embed"
 	"encoding/base64"
@@ -28,6 +30,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,6 +94,13 @@ type Config struct {
 	SMTPPass      string `json:"smtp_pass"`
 	DigestEnabled bool   `json:"digest_enabled"`
 	DigestHours   []int  `json:"digest_hours"`
+	// Twitter timeline integration
+	TwitterBearerToken    string `json:"twitter_bearer_token"`
+	TwitterEnabled        bool   `json:"twitter_enabled"`
+	TwitterConsumerKey    string `json:"twitter_consumer_key"`
+	TwitterConsumerSecret string `json:"twitter_consumer_secret"`
+	TwitterAccessToken    string `json:"twitter_access_token"`
+	TwitterAccessSecret   string `json:"twitter_access_secret"`
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -189,8 +199,11 @@ func defaultConfig() *Config {
 5. 回答にはURLを含めろ。URLが無ければ web_search で探せ。
 
 ## キーワード→ツール対応（この通りに動け）
+- タイムライン/フィード/自分のTwitter/フォロー → twitter_timeline
+- twitter/ツイッター/ツイート/tweet/検索 → twitter_search
 - ニュース/最新/トレンド/速報/news/latest → web_search
 - 教えて/調べて/検索/について → web_search
+- HuggingFace/GitHubのURL + 「使って」「動かして」「生成して」 → docker_run_model
 - URL/http/サイト → web_fetch
 - ファイル/読んで/書いて → read_file / write_file
 - コマンド/実行/install → execute_command
@@ -204,6 +217,8 @@ func defaultConfig() *Config {
 - execute_command: シェルコマンド実行
 - search_files, grep: ファイル検索
 - web_search: インターネット検索
+- twitter_search: Twitter/X検索（ツイート検索）
+- twitter_timeline: 自分のTwitterタイムライン取得
 - web_fetch: URL内容取得
 - web_images: URL画像抽出
 - diagram: Graphviz図生成
@@ -213,6 +228,7 @@ func defaultConfig() *Config {
 - recall_context: 現スレッド会話ログ検索
 - search_threads: 全スレッド横断検索
 - docker_exec: GPUコンテナ内コマンド実行
+- docker_run_model: HuggingFace/GitHubモデルをDocker GPU環境で自動実行
 - index_document: ドキュメント階層インデックス化
 - search_document: インデックス済みドキュメント検索
 - recall_memory: 学習知識検索
@@ -432,6 +448,32 @@ var tools = []Tool{
 		},
 	},
 	{
+		Name:        "twitter_search",
+		Description: "Search Twitter/X for recent tweets. Use this when the user asks about Twitter trends, specific topics on Twitter, or wants to see what people are saying about something on Twitter/X.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Search query for Twitter",
+				},
+				"max_results": map[string]interface{}{
+					"type":        "integer",
+					"description": "Maximum number of tweets to return (10-100, default 30)",
+				},
+			},
+			"required": []string{"query"},
+		},
+	},
+	{
+		Name:        "twitter_timeline",
+		Description: "Fetch the authenticated user's Twitter/X home timeline and summarize it. Use this when the user asks to see their timeline, what's happening on their feed, or wants a summary of recent tweets from people they follow.",
+		Parameters: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
+	{
 		Name:        "web_images",
 		Description: "Extract representative images from a web page (OGP image, main images). Returns markdown image syntax. Include the result directly in your response to display images.",
 		Parameters: map[string]interface{}{
@@ -557,6 +599,24 @@ var tools = []Tool{
 				},
 			},
 			"required": []string{"command"},
+		},
+	},
+	{
+		Name:        "docker_run_model",
+		Description: "HuggingFace/GitHubのモデルやリポジトリをDocker GPU環境で自動実行する。URLからREADMEを取得し、Pythonスクリプトを自動生成して実行する。CUDA OOM防止のため自動でollamaモデルをアンロードし、完了後にリロードする。",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"url": map[string]interface{}{
+					"type":        "string",
+					"description": "HuggingFace or GitHub URL of the model/repository",
+				},
+				"prompt": map[string]interface{}{
+					"type":        "string",
+					"description": "What to generate or execute (e.g., 'a cat playing piano')",
+				},
+			},
+			"required": []string{"url"},
 		},
 	},
 	{
@@ -929,8 +989,9 @@ var toolTriggers = map[string][]string{
 	"ブログ": {"blog_person_search"}, "人物": {"blog_person_search"},
 	"前の会話": {"search_conversation", "recall_context"}, "さっき": {"search_conversation", "recall_context"},
 	"会話": {"search_conversation", "recall_context", "search_threads"}, "思い出": {"recall_context", "recall_memory"},
-	"スレッド": {"search_threads"}, "docker": {"docker_exec"}, "コンテナ": {"docker_exec"},
+	"スレッド": {"search_threads"}, "docker": {"docker_exec", "docker_run_model"}, "コンテナ": {"docker_exec"},
 	"gpu": {"docker_exec"}, "ffmpeg": {"docker_exec"}, "whisper": {"docker_exec"},
+	"huggingface": {"docker_run_model"}, "github.com": {"docker_run_model"},
 	"インデックス": {"index_document", "search_document", "list_documents"},
 	"ドキュメント": {"index_document", "search_document", "list_documents"},
 	"document": {"index_document", "search_document", "list_documents"},
@@ -941,6 +1002,8 @@ var toolTriggers = map[string][]string{
 	"plugin": {"create_plugin", "test_plugin", "list_plugins", "delete_plugin"},
 	"query_model": {"query_model"}, "他のモデル": {"query_model"},
 	"画像": {"web_images"}, "image": {"web_images"},
+	"twitter": {"twitter_search", "twitter_timeline"}, "ツイッター": {"twitter_search", "twitter_timeline"}, "ツイート": {"twitter_search"},
+	"tweet": {"twitter_search"}, "x.com": {"twitter_search"}, "タイムライン": {"twitter_timeline"}, "フィード": {"twitter_timeline"},
 }
 
 // selectToolsForContext returns a filtered set of tools based on conversation context
@@ -1043,6 +1106,54 @@ func needsRunCode(userMsg string) bool {
 	return false
 }
 
+// extractSearchQuery uses LLM to extract an appropriate search query from the user message.
+// platform is "twitter" or "web". Falls back to simple keyword extraction if LLM fails.
+func extractSearchQuery(userMsg, platform string, config *Config) string {
+	// Try LLM extraction
+	prompt := fmt.Sprintf(`ユーザーの発言から%s検索に適したキーワードだけを抽出せよ。
+検索クエリのみ出力。説明不要。引用符不要。
+
+例:
+入力: "twitterから最新のAIニュースを検索して報告"
+出力: AI ニュース 最新
+
+入力: "ツイッターでGPT-5について何か言ってる？"
+出力: GPT-5
+
+入力: "最近のLLMのトレンドをtwitterで調べて"
+出力: LLM トレンド
+
+入力: "%s"
+出力:`, platform, userMsg)
+
+	if config != nil {
+		_, query, err := callSubModel(prompt, config)
+		if err == nil {
+			query = strings.TrimSpace(query)
+			// Remove quotes if LLM wrapped them
+			query = strings.Trim(query, "\"'「」")
+			if query != "" && len(query) < 200 {
+				fmt.Printf("[siki] Extracted %s search query: %q from %q\n", platform, query, userMsg)
+				return query
+			}
+		}
+	}
+
+	// Fallback: strip common noise words
+	lower := userMsg
+	noiseWords := []string{"twitter", "ツイッター", "ツイート", "から", "で", "を", "の", "して", "て",
+		"検索", "調べて", "教えて", "報告", "まとめて", "最新の", "について", "何か", "言ってる"}
+	for _, nw := range noiseWords {
+		lower = strings.ReplaceAll(lower, nw, " ")
+	}
+	lower = strings.Join(strings.Fields(lower), " ")
+	if lower == "" {
+		lower = userMsg
+	}
+	fmt.Printf("[siki] Fallback %s search query: %q from %q\n", platform, lower, userMsg)
+	return lower
+}
+
 // overrideToolArgs replaces unreliable tool arguments from the small orchestrator model
 // with sensible defaults based on the user's actual message. The 1.2B model's job is
 // to choose WHICH tool to call — argument generation is handled here.
@@ -1057,6 +1168,11 @@ func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interfac
 			originalArgs["query"] = userMsg
 		}
 
+	case "twitter_search":
+		if q, _ := originalArgs["query"].(string); q == "" {
+			originalArgs["query"] = extractSearchQuery(userMsg, "twitter", config)
+		}
+
 	case "web_fetch":
 		// Extract URL from user message if model didn't provide a valid one
 		url, _ := originalArgs["url"].(string)
@@ -1068,6 +1184,30 @@ func overrideToolArgs(toolName, userMsg string, originalArgs map[string]interfac
 					break
 				}
 			}
+		}
+
+	case "docker_run_model":
+		// Extract URL from user message if not provided
+		url, _ := originalArgs["url"].(string)
+		if url == "" || !strings.HasPrefix(url, "http") {
+			for _, word := range strings.Fields(userMsg) {
+				if (strings.Contains(word, "huggingface.co/") || strings.Contains(word, "github.com/")) &&
+					strings.HasPrefix(word, "http") {
+					originalArgs["url"] = word
+					break
+				}
+			}
+		}
+		// Use remaining text (without URL) as prompt
+		prompt, _ := originalArgs["prompt"].(string)
+		if prompt == "" {
+			var parts []string
+			for _, word := range strings.Fields(userMsg) {
+				if !strings.HasPrefix(word, "http") {
+					parts = append(parts, word)
+				}
+			}
+			originalArgs["prompt"] = strings.Join(parts, " ")
 		}
 
 	case "run_code":
@@ -1270,9 +1410,10 @@ func autoToolFallback(agent *Agent, userMsg string, modelResponse string, sendEv
 // ============================================================================
 
 type Agent struct {
-	config   *Config
-	messages []Message
-	threadID string
+	config    *Config
+	messages  []Message
+	threadID  string
+	sendEvent func(StreamEvent) // optional: for tools that need to emit progress to the UI
 }
 
 // lastUserMessage returns the content of the most recent user message
@@ -1341,6 +1482,105 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (result st
 		return a.grep(args["pattern"].(string), path)
 	case "web_search":
 		return a.webSearch(args["query"].(string))
+	case "twitter_search":
+		query, _ := args["query"].(string)
+		if query == "" {
+			return "", fmt.Errorf("query is required for twitter_search")
+		}
+		maxResults := 30
+		if n, ok := args["max_results"].(float64); ok && n > 0 {
+			maxResults = int(n)
+		}
+		return twitterSearch(query, maxResults, a.config)
+	case "twitter_timeline":
+		if !hasTwitterOAuth1a(a.config) {
+			return "", fmt.Errorf("Twitter OAuth 1.0a が設定されていません。設定画面からConsumer Key/Secret, Access Token/Secretを設定してください")
+		}
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: "タイムラインを取得中..."})
+		}
+		tweets, err := fetchTwitterTimeline(a.config)
+		if err != nil {
+			return "", fmt.Errorf("タイムライン取得失敗: %v", err)
+		}
+		if len(tweets) == 0 {
+			return "タイムラインにツイートがありません。", nil
+		}
+		// Show raw timeline immediately so user doesn't wait
+		rawTimeline := formatTweets(tweets, fmt.Sprintf("タイムライン（%d件）", len(tweets)))
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "tool_call", Name: "twitter_timeline", Result: rawTimeline})
+		}
+		// Extract the actual topic of interest from user message
+		userIntent, _ := args["intent"].(string)
+		if userIntent == "" {
+			userIntent = a.lastUserMessage()
+		}
+		// Fast model extracts the core topic
+		intentPrompt := fmt.Sprintf(`Extract the search topic from this message. Remove action/instruction words (twitter, タイムライン, まとめて, 検索, 拾って, etc). Output ONLY the topic, nothing else.
+Message: %s
+Topic:`, userIntent)
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: "テーマ抽出中..."})
+		}
+		extractedIntent, err := callFastModel(intentPrompt, a.config)
+		if err == nil && strings.TrimSpace(extractedIntent) != "" {
+			extractedIntent = strings.TrimSpace(extractedIntent)
+			// Remove quotes if LLM wraps in them
+			extractedIntent = strings.Trim(extractedIntent, "「」\"'")
+			if extractedIntent != "" {
+				fmt.Printf("[siki] Extracted intent: %q -> %q\n", userIntent, extractedIntent)
+				userIntent = extractedIntent
+			}
+		}
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("テーマ: %s", userIntent)})
+		}
+		filtered := filterTweetsByIntent(tweets, userIntent, a.config, a.sendEvent)
+		if len(filtered) == 0 {
+			return fmt.Sprintf("\n\n---\nAI選別結果: %d件中、「%s」に該当するツイートはありませんでした。", len(tweets), userIntent), nil
+		}
+		// Evaluate importance and deep-dive worthiness for each filtered tweet
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("%d件を抽出。重要度を評価中...", len(filtered))})
+		}
+		deepDiveIdxs := evaluateAndSelectDeepDive(filtered, userIntent, a.config, a.sendEvent)
+
+		// Fetch threads in parallel for deep-dive tweets
+		type threadResult struct {
+			idx  int
+			data ThreadData
+		}
+		if len(deepDiveIdxs) > 0 && a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("%d件のスレッドを深掘り中...", len(deepDiveIdxs))})
+		}
+		// Filter valid indices first
+		var validDiveIdxs []int
+		for _, idx := range deepDiveIdxs {
+			if idx >= 0 && idx < len(filtered) {
+				validDiveIdxs = append(validDiveIdxs, idx)
+			}
+		}
+		threadCh := make(chan threadResult, len(validDiveIdxs))
+		for _, idx := range validDiveIdxs {
+			go func(i int) {
+				replies, err := fetchConversationThread(filtered[i].ID, filtered[i].Author, a.config)
+				if err != nil {
+					fmt.Printf("[siki] Thread fetch failed for %s: %v\n", filtered[i].ID, err)
+					threadCh <- threadResult{i, ThreadData{}}
+					return
+				}
+				threadCh <- threadResult{i, ThreadData{TweetIndex: i, Replies: replies}}
+			}(idx)
+		}
+		var threads []ThreadData
+		for range validDiveIdxs {
+			tr := <-threadCh
+			if len(tr.data.Replies) > 0 {
+				threads = append(threads, tr.data)
+			}
+		}
+		return formatTweetsWithThreads(filtered, fmt.Sprintf("\n\n---\n## AI選別結果: %d件中%d件を抽出", len(tweets), len(filtered)), threads), nil
 	case "web_fetch":
 		return a.webFetch(args["url"].(string))
 	case "web_images":
@@ -1394,6 +1634,13 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (result st
 			timeout = int(t)
 		}
 		return dockerExec(args["command"].(string), timeout)
+	case "docker_run_model":
+		url, _ := args["url"].(string)
+		if url == "" {
+			return "", fmt.Errorf("url is required for docker_run_model")
+		}
+		prompt, _ := args["prompt"].(string)
+		return dockerRunModel(url, prompt, a.config, a.sendEvent)
 	case "generate_image":
 		prompt, _ := args["prompt"].(string)
 		if prompt == "" {
@@ -3041,6 +3288,84 @@ func streamVLLMGenerate(model, prompt string, maxTokens int, timeout time.Durati
 	return fullResponse.String(), nil
 }
 
+// streamOllamaGenerate streams a response from Ollama's /api/generate endpoint.
+// Handles <think></think> blocks from thinking models (gpt-oss).
+func streamOllamaGenerate(model, prompt string, maxTokens int, timeout time.Duration, sendEvent func(StreamEvent)) (string, error) {
+	reqBody := map[string]interface{}{
+		"model":  model,
+		"prompt": prompt,
+		"stream": true,
+		"options": map[string]interface{}{
+			"num_predict": maxTokens,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("ollama stream error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var fullResponse strings.Builder
+	inThinking := false
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		var chunk struct {
+			Response string `json:"response"`
+			Done     bool   `json:"done"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+			continue
+		}
+		text := chunk.Response
+		if text == "" {
+			if chunk.Done {
+				break
+			}
+			continue
+		}
+		// Handle <think> blocks
+		if strings.Contains(text, "<think>") {
+			inThinking = true
+			if idx := strings.Index(text, "<think>"); idx > 0 {
+				fullResponse.WriteString(text[:idx])
+				sendEvent(StreamEvent{Type: "content", Content: text[:idx]})
+			}
+			after := ""
+			if idx := strings.Index(text, "<think>"); idx+7 < len(text) {
+				after = text[idx+7:]
+			}
+			if after != "" {
+				sendEvent(StreamEvent{Type: "thinking", Content: after})
+			}
+			continue
+		}
+		if strings.Contains(text, "</think>") {
+			inThinking = false
+			if idx := strings.Index(text, "</think>"); idx > 0 {
+				sendEvent(StreamEvent{Type: "thinking", Content: text[:idx]})
+			}
+			if idx := strings.Index(text, "</think>"); idx+8 < len(text) {
+				after := text[idx+8:]
+				fullResponse.WriteString(after)
+				sendEvent(StreamEvent{Type: "content", Content: after})
+			}
+			continue
+		}
+		if inThinking {
+			sendEvent(StreamEvent{Type: "thinking", Content: text})
+			continue
+		}
+		fullResponse.WriteString(text)
+		sendEvent(StreamEvent{Type: "content", Content: text})
+	}
+	return fullResponse.String(), nil
+}
+
 // alternateSubModels returns the two sub-models available for retry alternation.
 // Primary is config.SubModel (qwen3.5), secondary is gpt-oss.
 func alternateSubModels(config *Config) (primary, secondary string) {
@@ -3070,9 +3395,48 @@ func callSubModel(prompt string, config *Config) (thinking string, response stri
 	return callSubModelWith(prompt, config, "")
 }
 
+// callFastModel calls a fast, lightweight model (LFM2.5) for quick tasks like
+// keyword extraction and intent parsing. Falls back to sub-model if unavailable.
+const fastModelName = "hf.co/unsloth/LFM2.5-1.2B-Instruct-GGUF:Q4_K_M"
+
+func callFastModel(prompt string, config *Config, maxTokens ...int) (string, error) {
+	numPredict := 300
+	if len(maxTokens) > 0 && maxTokens[0] > 0 {
+		numPredict = maxTokens[0]
+	}
+	reqBody := map[string]interface{}{
+		"model":  fastModelName,
+		"prompt": prompt,
+		"stream": false,
+		"options": map[string]interface{}{
+			"num_predict": numPredict,
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		// Fallback to sub-model
+		fmt.Printf("[siki] callFastModel failed (%v), falling back to sub-model\n", err)
+		_, content, err2 := callSubModel(prompt, config)
+		return content, err2
+	}
+	defer resp.Body.Close()
+	var genResp struct {
+		Response string `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(genResp.Response), nil
+}
+
 // callSubModelWith calls a specific model (or default sub-model if modelOverride is empty).
 // It handles <think></think> tag extraction, returning (thinking, response).
-func callSubModelWith(prompt string, config *Config, modelOverride string) (thinking string, response string, err error) {
+func callSubModelWith(prompt string, config *Config, modelOverride string, timeout ...time.Duration) (thinking string, response string, err error) {
 	model := config.SubModel
 	if modelOverride != "" {
 		model = modelOverride
@@ -3081,11 +3445,16 @@ func callSubModelWith(prompt string, config *Config, modelOverride string) (thin
 		return "", "", fmt.Errorf("no sub-model configured")
 	}
 
+	timeoutDur := 120 * time.Second
+	if len(timeout) > 0 && timeout[0] > 0 {
+		timeoutDur = timeout[0]
+	}
+
 	endpoint := subModelEndpoint(config)
 
 	// Use vllm (OpenAI-compatible) API if configured
 	if modelOverride == "" && isSubModelVLLM(config) {
-		content, err := callVLLMGenerate(model, prompt, 32768, 120*time.Second, endpoint)
+		content, err := callVLLMGenerate(model, prompt, 32768, timeoutDur, endpoint)
 		if err != nil {
 			return "", "", err
 		}
@@ -3108,7 +3477,7 @@ func callSubModelWith(prompt string, config *Config, modelOverride string) (thin
 		return "", "", fmt.Errorf("marshal error: %w", err)
 	}
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: timeoutDur}
 	resp, err := client.Post(endpoint+"/api/generate", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", "", fmt.Errorf("sub-model request error: %w", err)
@@ -4593,6 +4962,8 @@ func (ws *WebServer) executeToolAndSummarize(agent *Agent, userMsg, toolName str
 	args := map[string]interface{}{}
 	if toolName == "web_search" {
 		args["query"] = userMsg
+	} else if toolName == "twitter_search" {
+		args["query"] = extractSearchQuery(userMsg, "twitter", nil)
 	}
 
 	// Generate DOT code for diagram
@@ -4742,8 +5113,60 @@ func extractURLsFromSearchResults(searchResult string) []string {
 
 // detectToolFromKeywords determines which tool to use based on keyword matching.
 // Instant, deterministic fallback when gpt-oss orchestration fails.
+// isHFGitHubRunRequest returns true if the message contains a HuggingFace/GitHub URL
+// along with an action word indicating the user wants to run/use the model.
+func isHFGitHubRunRequest(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	if !strings.Contains(lower, "huggingface.co/") && !strings.Contains(lower, "github.com/") {
+		return false
+	}
+	actionWords := []string{"使って", "使い", "動かし", "実行", "生成", "試し", "走らせ", "run", "use", "generate", "やって", "して"}
+	for _, aw := range actionWords {
+		if strings.Contains(lower, aw) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectTwitterTool returns "twitter_timeline" for timeline requests,
+// "twitter_search" for search requests, or "" if no Twitter keyword found.
+func detectTwitterTool(userMsg string) string {
+	lower := strings.ToLower(userMsg)
+	// Check for timeline-specific keywords first
+	timelineKws := []string{"タイムライン", "timeline", "フィード", "feed", "自分のtwitter", "自分のツイッター", "フォロー"}
+	for _, kw := range timelineKws {
+		if strings.Contains(lower, kw) {
+			return "twitter_timeline"
+		}
+	}
+	// General Twitter keywords → search
+	searchKws := []string{"twitter", "ツイッター", "ツイート", "tweet", "x.com"}
+	for _, kw := range searchKws {
+		if strings.Contains(lower, kw) {
+			return "twitter_search"
+		}
+	}
+	return ""
+}
+
+func containsTwitterKeywords(userMsg string) bool {
+	return detectTwitterTool(userMsg) != ""
+}
+
 func detectToolFromKeywords(userMsg string) string {
 	lower := strings.ToLower(userMsg)
+
+	// HuggingFace/GitHub URL + action word → docker_run_model (before generic URL rule)
+	if strings.Contains(lower, "huggingface.co/") || strings.Contains(lower, "github.com/") {
+		actionWords := []string{"使って", "使い", "動かし", "実行", "生成", "試し", "走らせ", "run", "use", "generate", "やって", "して"}
+		for _, aw := range actionWords {
+			if strings.Contains(lower, aw) {
+				fmt.Printf("[siki] Keyword fallback: HF/GitHub URL + '%s' → docker_run_model\n", aw)
+				return "docker_run_model"
+			}
+		}
+	}
 
 	type toolRule struct {
 		keywords []string
@@ -4754,6 +5177,8 @@ func detectToolFromKeywords(userMsg string) string {
 		{[]string{"動画生成", "動画を生成", "動画を作", "ビデオ生成", "ビデオを作", "映像生成", "映像を作", "video generat", "generate video", "アニメーション生成"}, "generate_video"},
 		{[]string{"画像生成", "イラスト描", "インフォグラフィック", "image generat", "generate image", "画像を生成", "画像を作"}, "generate_image"},
 		{[]string{"過去の会話", "会話ログ", "過去ログ", "前の会話", "さっきの会話", "会話履歴", "スレッド検索", "やり取り"}, "search_threads"},
+		{[]string{"タイムライン", "timeline", "フィード", "feed"}, "twitter_timeline"},
+		{[]string{"twitter", "ツイッター", "ツイート", "tweet", "x.com"}, "twitter_search"},
 		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "web_search"},
 		{[]string{"調べて", "検索", "教えて", "について", "とは"}, "web_search"},
 		{[]string{"http://", "https://"}, "web_fetch"},
@@ -5350,6 +5775,84 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		// Fall through to normal pipeline if escalation didn't work
 	}
 
+	// Fast-path: skip orchestrator entirely for Twitter requests (keyword match is definitive)
+	if containsTwitterKeywords(userMsg) {
+		twitterTool := detectTwitterTool(userMsg)
+		fmt.Printf("[siki] Fast-path: %s (skipping orchestrator)\n", twitterTool)
+
+		agent.sendEvent = sendEvent // allow tools to emit progress to UI
+		args := map[string]interface{}{}
+		if twitterTool == "twitter_search" {
+			args["query"] = extractSearchQuery(userMsg, "twitter", nil)
+		}
+
+		sendEvent(StreamEvent{Type: "tool_start", Name: twitterTool})
+		result, err := agent.executeTool(twitterTool, args)
+		if err != nil {
+			sendEvent(StreamEvent{Type: "error", Error: fmt.Sprintf("Twitter error: %v", err)})
+			return ""
+		}
+		sendEvent(StreamEvent{Type: "tool_call", Name: twitterTool, Result: result})
+
+		// Save tool call to conversation
+		toolCallID := fmt.Sprintf("fast-%d", time.Now().UnixMilli())
+		argsJSON, _ := json.Marshal(args)
+		assistantMsg := Message{Role: "assistant", ToolCalls: []ToolCall{{ID: toolCallID, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: twitterTool, Arguments: string(argsJSON)}}}}
+		agent.messages = append(agent.messages, assistantMsg)
+		saveMsg(assistantMsg, "")
+		toolMsg := Message{Role: "tool", Content: result, ToolCallID: toolCallID}
+		agent.messages = append(agent.messages, toolMsg)
+		saveMsg(toolMsg, twitterTool)
+
+		// Generate final summary using gpt-oss (streaming)
+		// Truncate result to fit context
+		summaryInput := result
+		if len([]rune(summaryInput)) > 6000 {
+			summaryInput = string([]rune(summaryInput)[:6000]) + "\n...(省略)"
+		}
+		summaryPrompt := fmt.Sprintf(`あなたはニュースキュレーターです。以下はTwitterタイムラインからAIが選別したツイートです。ユーザーの要求「%s」に基づき、重要なニュースや話題をわかりやすくまとめてください。
+- 重要度の高い順に整理
+- 各トピックの要点を簡潔に
+- 注目すべきリンクがあれば言及
+- 日本語で回答
+
+選別結果:
+%s`, userMsg, summaryInput)
+
+		sendEvent(StreamEvent{Type: "progress", Content: "gpt-ossでまとめを生成中..."})
+		// Try vllm first, fallback to ollama
+		summary, err := streamVLLMGenerate(
+			ws.config.ModelName,
+			summaryPrompt,
+			2048,
+			120*time.Second,
+			ws.config.APIEndpoint,
+			sendEvent,
+		)
+		if err != nil {
+			fmt.Printf("[siki] vllm summary failed: %v, trying ollama gpt-oss...\n", err)
+			summary, err = streamOllamaGenerate("gpt-oss:latest", summaryPrompt, 2048, 120*time.Second, sendEvent)
+			if err != nil {
+				fmt.Printf("[siki] ollama summary also failed: %v, using raw result\n", err)
+				summary = result
+			}
+		}
+
+		finalMsg := Message{Role: "assistant", Content: summary}
+		agent.messages = append(agent.messages, finalMsg)
+		saveMsg(finalMsg, "")
+		sendEvent(StreamEvent{Type: "done"})
+		if cID != "" {
+			ws.mu.Lock()
+			ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: twitterTool, Args: args, ToolResult: result, Response: summary, UsedAgent: false}
+			ws.mu.Unlock()
+		}
+		return summary
+	}
+
 	// Phase 1: Quick ack from lfm (parallel with Phase 2)
 	ackCh := make(chan string, 1)
 	go func() {
@@ -5491,6 +5994,23 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 			decision.Tool = detected
 			decision.Args = nil
 		}
+	}
+
+	// Force twitter tool when message contains Twitter keywords
+	// The orchestrator often misroutes these to web_search
+	if decision.Tool != "twitter_search" && decision.Tool != "twitter_timeline" && containsTwitterKeywords(userMsg) {
+		twitterTool := detectTwitterTool(userMsg)
+		fmt.Printf("[siki] Forcing %s: Twitter keyword detected (was: %s)\n", twitterTool, decision.Tool)
+		decision.Tool = twitterTool
+		decision.Args = nil
+	}
+
+	// Force docker_run_model when HuggingFace/GitHub URL + action word is present
+	// The orchestrator often misroutes these to generate_video or web_fetch
+	if decision.Tool != "docker_run_model" && isHFGitHubRunRequest(userMsg) {
+		fmt.Printf("[siki] Forcing docker_run_model: HF/GitHub URL + action detected (was: %s)\n", decision.Tool)
+		decision.Tool = "docker_run_model"
+		decision.Args = nil
 	}
 
 	// Force plan mode for comic requests (4コマ漫画 requires multi-step: scenario + 4 images)
@@ -5698,6 +6218,11 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		if _, ok := args["query"]; !ok {
 			args["query"] = userMsg
 		}
+	} else if toolName == "twitter_search" {
+		if _, ok := args["query"]; !ok {
+			// Use LLM to extract a good search query from the user message
+			args["query"] = extractSearchQuery(userMsg, "twitter", ws.config)
+		}
 	} else if toolName == "search_threads" || toolName == "search_conversation" || toolName == "recall_context" {
 		if _, ok := args["query"]; !ok {
 			args["query"] = userMsg
@@ -5731,6 +6256,27 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 					break
 				}
 			}
+		}
+	} else if toolName == "docker_run_model" {
+		// Extract HuggingFace/GitHub URL from user message
+		if _, ok := args["url"]; !ok {
+			for _, word := range strings.Fields(userMsg) {
+				if (strings.Contains(word, "huggingface.co/") || strings.Contains(word, "github.com/")) &&
+					strings.HasPrefix(word, "http") {
+					args["url"] = word
+					break
+				}
+			}
+		}
+		// Use remaining text (minus URL) as prompt
+		if _, ok := args["prompt"]; !ok {
+			var parts []string
+			for _, word := range strings.Fields(userMsg) {
+				if !strings.HasPrefix(word, "http") {
+					parts = append(parts, word)
+				}
+			}
+			args["prompt"] = strings.Join(parts, " ")
 		}
 	}
 
@@ -5889,13 +6435,97 @@ digraph G {
 		}
 	}
 
+	agent.sendEvent = sendEvent // allow tools to emit progress to UI
 	result, err := agent.executeTool(toolName, args)
 	if err != nil {
-		result = fmt.Sprintf("Error: %v", err)
+		errStr := fmt.Sprintf("Error: %v", err)
+		fmt.Printf("[siki] Tool %s failed: %v — attempting recovery with alternate model\n", toolName, err)
+		sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: errStr})
+		sendEvent(modelThinkingEvent("ツール実行エラー。別モデルで再検討中...", ws.config, hasSubAgent(ws.config)))
+
+		// Ask alternate LLM to re-analyze and suggest a fix
+		altModel := pickRetryModel(ws.config, 1)
+		argsJSONForPrompt, _ := json.Marshal(args)
+		recoveryPrompt := fmt.Sprintf(`ツール「%s」の実行でエラーが発生した。
+
+## ユーザーリクエスト:
+%s
+
+## 実行したツール: %s
+## 引数: %s
+## エラー:
+%s
+
+以下のいずれかを提案せよ：
+1. 引数を修正して同じツールを再実行（JSON形式: {"action":"retry","tool":"%s","args":{...}}）
+2. 別のツールで代替（JSON形式: {"action":"switch","tool":"別ツール名","args":{...}}）
+3. ツールなしで直接回答（JSON形式: {"action":"direct","response":"回答テキスト"}）
+
+JSONのみ出力。説明不要。`, toolName, userMsg, toolName, string(argsJSONForPrompt), errStr, toolName)
+
+		_, recovery, recErr := callSubModelWith(recoveryPrompt, ws.config, altModel)
+		recovered := false
+		if recErr == nil && len(recovery) > 5 {
+			recovery = strings.TrimSpace(recovery)
+			if idx := strings.Index(recovery, "```json"); idx >= 0 {
+				recovery = recovery[idx+7:]
+				if end := strings.Index(recovery, "```"); end >= 0 { recovery = recovery[:end] }
+			} else if idx := strings.Index(recovery, "```"); idx >= 0 {
+				recovery = recovery[idx+3:]
+				if end := strings.Index(recovery, "```"); end >= 0 { recovery = recovery[:end] }
+			}
+			recovery = strings.TrimSpace(recovery)
+
+			var plan struct {
+				Action   string                 `json:"action"`
+				Tool     string                 `json:"tool"`
+				Args     map[string]interface{} `json:"args"`
+				Response string                 `json:"response"`
+			}
+			if json.Unmarshal([]byte(recovery), &plan) == nil {
+				switch plan.Action {
+				case "retry":
+					fmt.Printf("[siki] Recovery: retrying %s with fixed args (via %s)\n", toolName, altModel)
+					if plan.Args != nil {
+						for k, v := range plan.Args { args[k] = v }
+					}
+					sendEvent(modelThinkingEvent("修正した引数で再実行中...", ws.config, false))
+					result, err = agent.executeTool(toolName, args)
+					if err == nil { recovered = true } else {
+						result = fmt.Sprintf("Error (retry): %v", err)
+					}
+				case "switch":
+					if plan.Tool != "" && plan.Tool != toolName {
+						fmt.Printf("[siki] Recovery: switching %s → %s (via %s)\n", toolName, plan.Tool, altModel)
+						sendEvent(modelThinkingEvent(fmt.Sprintf("別ツール %s で再試行中...", plan.Tool), ws.config, false))
+						newArgs := plan.Args
+						if newArgs == nil { newArgs = args }
+						toolName = plan.Tool
+						result, err = agent.executeTool(toolName, newArgs)
+						if err == nil { recovered = true; args = newArgs } else {
+							result = fmt.Sprintf("Error (switch): %v", err)
+						}
+					}
+				case "direct":
+					if plan.Response != "" {
+						fmt.Printf("[siki] Recovery: direct response from %s\n", altModel)
+						sendEvent(StreamEvent{Type: "content", Content: plan.Response})
+						finalMsg := Message{Role: "assistant", Content: plan.Response}
+						agent.messages = append(agent.messages, finalMsg)
+						saveMsg(finalMsg, "")
+						return plan.Response
+					}
+				}
+			}
+		}
+		if !recovered {
+			result = errStr
+		}
 	}
 
 	displayResult := result
-	if len(displayResult) > 2000 {
+	// Don't truncate twitter results — they are already LLM-filtered
+	if len(displayResult) > 2000 && toolName != "twitter_timeline" && toolName != "twitter_search" {
 		displayResult = displayResult[:2000] + "\n... (truncated)"
 	}
 	sendEvent(StreamEvent{Type: "tool_call", Name: toolName, Result: displayResult})
@@ -5925,8 +6555,8 @@ digraph G {
 	agent.messages = append(agent.messages, toolMsg)
 	saveMsg(toolMsg, toolName)
 
-	// For run_code/diagram/generate_image, the tool result IS the response (iframe/image)
-	if toolName == "run_code" || toolName == "diagram" || toolName == "generate_image" {
+	// For these tools, the tool result IS the response (no LLM re-summarization needed)
+	if toolName == "run_code" || toolName == "diagram" || toolName == "generate_image" || toolName == "twitter_timeline" || toolName == "twitter_search" {
 		finalMsg := Message{Role: "assistant", Content: result}
 		agent.messages = append(agent.messages, finalMsg)
 		saveMsg(finalMsg, "")
@@ -7847,17 +8477,29 @@ JSONのみ出力せよ。`, userMsgs.String())
 
 // DigestConfig is the persistable subset of digest/email settings.
 type DigestConfig struct {
-	EmailTo       string `json:"email_to"`
-	EmailFrom     string `json:"email_from"`
-	SMTPHost      string `json:"smtp_host"`
-	SMTPPort      int    `json:"smtp_port"`
-	SMTPUser      string `json:"smtp_user"`
-	SMTPPass      string `json:"smtp_pass"`
-	DigestEnabled bool   `json:"digest_enabled"`
-	DigestHours   []int  `json:"digest_hours"`
+	EmailTo            string `json:"email_to"`
+	EmailFrom          string `json:"email_from"`
+	SMTPHost           string `json:"smtp_host"`
+	SMTPPort           int    `json:"smtp_port"`
+	SMTPUser           string `json:"smtp_user"`
+	SMTPPass           string `json:"smtp_pass"`
+	DigestEnabled      bool   `json:"digest_enabled"`
+	DigestHours        []int  `json:"digest_hours"`
+	TwitterBearerToken    string `json:"twitter_bearer_token"`
+	TwitterEnabled        bool   `json:"twitter_enabled"`
+	TwitterConsumerKey    string `json:"twitter_consumer_key"`
+	TwitterConsumerSecret string `json:"twitter_consumer_secret"`
+	TwitterAccessToken    string `json:"twitter_access_token"`
+	TwitterAccessSecret   string `json:"twitter_access_secret"`
 }
 
+// digestConfigDir can be overridden in tests to avoid writing to the real ~/.siki/
+var digestConfigDir string
+
 func digestConfigPath() string {
+	if digestConfigDir != "" {
+		return filepath.Join(digestConfigDir, "digest_config.json")
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".siki", "digest_config.json")
 }
@@ -7898,6 +8540,12 @@ func applyDigestConfig(config *Config) {
 	config.SMTPPass = dc.SMTPPass
 	config.DigestEnabled = dc.DigestEnabled
 	config.DigestHours = dc.DigestHours
+	config.TwitterBearerToken = dc.TwitterBearerToken
+	config.TwitterEnabled = dc.TwitterEnabled
+	config.TwitterConsumerKey = dc.TwitterConsumerKey
+	config.TwitterConsumerSecret = dc.TwitterConsumerSecret
+	config.TwitterAccessToken = dc.TwitterAccessToken
+	config.TwitterAccessSecret = dc.TwitterAccessSecret
 }
 
 func (ws *WebServer) digestLoop() {
@@ -8029,6 +8677,27 @@ JSON配列のみ出力: ["クエリ1","クエリ2","クエリ3"]`, dateStr, date
 	}
 	fmt.Printf("[siki] Digest: fresh results: %d bytes\n", len(freshResults))
 
+	// 4.5 Twitter timeline (if enabled)
+	if ws.config.TwitterEnabled && ws.config.TwitterBearerToken != "" {
+		fmt.Println("[siki] Digest: fetching Twitter timeline...")
+		tweets, tErr := fetchTwitterTimeline(ws.config)
+		if tErr != nil {
+			fmt.Printf("[siki] Digest: Twitter fetch failed: %v\n", tErr)
+		} else if len(tweets) > 0 {
+			twitterHTML, sErr := filterAndSummarizeTwitter(tweets, ws.config)
+			if sErr != nil {
+				fmt.Printf("[siki] Digest: Twitter summary failed: %v\n", sErr)
+			} else if twitterHTML != "" {
+				freshResults += "\n\n## Twitterタイムライン（AI関連）:\n" + twitterHTML
+				fmt.Printf("[siki] Digest: Twitter section added (%d bytes)\n", len(twitterHTML))
+			} else {
+				fmt.Println("[siki] Digest: no AI-related tweets found in timeline")
+			}
+		} else {
+			fmt.Println("[siki] Digest: no tweets in timeline (last 12h)")
+		}
+	}
+
 	// 5. Summarize with LLM
 	fmt.Println("[siki] Digest: summarizing results...")
 	summaryPrompt := fmt.Sprintf(`今日は%s%d日です。以下の検索結果をもとに、ユーザーにとって有益な最新情報を選んでダイジェストにまとめよ。
@@ -8103,6 +8772,800 @@ HTML本文のみ出力せよ。`, dateStr, now.Day(), now.Year(), truncateString
 	digestMsg := Message{Role: "assistant", Content: fmt.Sprintf("# %s\n\n%s", subject, htmlBody)}
 	appendMessageToThread(digestThreadID, digestMsg, "")
 	saveThreadMeta(&Thread{ID: digestThreadID, Title: subject, CreatedAt: now, UpdatedAt: now, MessageCount: 1})
+}
+
+// ============================================================================
+// Twitter Timeline Integration (API v2)
+// ============================================================================
+
+// TwitterMedia represents a media attachment (photo, video, animated_gif).
+type TwitterMedia struct {
+	Type       string // "photo", "video", "animated_gif"
+	URL        string // direct URL for photo, preview for video
+	PreviewURL string // thumbnail
+}
+
+// TwitterTweet represents a single tweet from the timeline.
+type TwitterTweet struct {
+	ID        string `json:"id"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+	AuthorID  string `json:"author_id"`
+	Author          string // expanded from includes.users
+	ProfileImageURL string // user's profile icon
+	Media           []TwitterMedia
+	URLs            []string // expanded URLs from entities
+	ReplyCount      int    // from public_metrics
+	RetweetCount    int    // from public_metrics
+	LikeCount       int    // from public_metrics
+}
+
+// cachedTwitterUserID caches the authenticated user's ID to avoid repeated /users/me calls.
+var cachedTwitterUserID string
+
+// hasTwitterOAuth1a returns true if OAuth 1.0a credentials are fully configured.
+func hasTwitterOAuth1a(config *Config) bool {
+	return config.TwitterConsumerKey != "" && config.TwitterConsumerSecret != "" &&
+		config.TwitterAccessToken != "" && config.TwitterAccessSecret != ""
+}
+
+// percentEncode encodes a string per RFC 3986 (OAuth 1.0a requires this, NOT application/x-www-form-urlencoded).
+func percentEncode(s string) string {
+	// url.QueryEscape uses + for space; OAuth needs %20
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
+}
+
+// oauthSign generates an OAuth 1.0a Authorization header for a Twitter API request.
+func oauthSign(method, rawURL string, queryParams url.Values, config *Config) string {
+	nonce := fmt.Sprintf("%d%d", time.Now().UnixNano(), rand.Int63())
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+
+	// Collect all params (OAuth + query) for signature
+	type kv struct{ k, v string }
+	var params []kv
+	oauthKV := [][2]string{
+		{"oauth_consumer_key", config.TwitterConsumerKey},
+		{"oauth_nonce", nonce},
+		{"oauth_signature_method", "HMAC-SHA1"},
+		{"oauth_timestamp", timestamp},
+		{"oauth_token", config.TwitterAccessToken},
+		{"oauth_version", "1.0"},
+	}
+	for _, p := range oauthKV {
+		params = append(params, kv{p[0], p[1]})
+	}
+	for k, vs := range queryParams {
+		for _, v := range vs {
+			params = append(params, kv{k, v})
+		}
+	}
+
+	// Sort by key, then value (RFC 5849 Section 3.4.1.3.2)
+	sort.Slice(params, func(i, j int) bool {
+		if params[i].k == params[j].k {
+			return params[i].v < params[j].v
+		}
+		return params[i].k < params[j].k
+	})
+
+	// Build parameter string with percent encoding
+	var paramParts []string
+	for _, p := range params {
+		paramParts = append(paramParts, percentEncode(p.k)+"="+percentEncode(p.v))
+	}
+	paramString := strings.Join(paramParts, "&")
+
+	// Base URL (strip query string)
+	parsedURL, _ := url.Parse(rawURL)
+	baseURL := fmt.Sprintf("%s://%s%s", parsedURL.Scheme, parsedURL.Host, parsedURL.Path)
+
+	// Signature base string
+	signatureBase := strings.ToUpper(method) + "&" + percentEncode(baseURL) + "&" + percentEncode(paramString)
+
+	// Signing key
+	signingKey := percentEncode(config.TwitterConsumerSecret) + "&" + percentEncode(config.TwitterAccessSecret)
+
+	// HMAC-SHA1
+	mac := hmac.New(sha1.New, []byte(signingKey))
+	mac.Write([]byte(signatureBase))
+	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	// Build Authorization header
+	return fmt.Sprintf(`OAuth oauth_consumer_key="%s", oauth_nonce="%s", oauth_signature="%s", oauth_signature_method="HMAC-SHA1", oauth_timestamp="%s", oauth_token="%s", oauth_version="1.0"`,
+		percentEncode(config.TwitterConsumerKey),
+		percentEncode(nonce),
+		percentEncode(signature),
+		percentEncode(timestamp),
+		percentEncode(config.TwitterAccessToken))
+}
+
+// twitterAPIGet makes an authenticated GET request to Twitter API v2.
+// Uses OAuth 1.0a if available (required for user-context endpoints like timeline),
+// falls back to Bearer Token for app-only endpoints like search.
+func twitterAPIGet(apiURL string, config *Config, requireUserContext bool) (*http.Response, error) {
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if requireUserContext && hasTwitterOAuth1a(config) {
+		// OAuth 1.0a: parse query params for signature
+		parsedURL, _ := url.Parse(apiURL)
+		authHeader := oauthSign("GET", apiURL, parsedURL.Query(), config)
+		req.Header.Set("Authorization", authHeader)
+	} else if config.TwitterBearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+config.TwitterBearerToken)
+	} else {
+		return nil, fmt.Errorf("no Twitter authentication configured")
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	return client.Do(req)
+}
+
+// fetchTwitterUserID gets the authenticated user's ID.
+func fetchTwitterUserID(config *Config) (string, error) {
+	if cachedTwitterUserID != "" {
+		return cachedTwitterUserID, nil
+	}
+	apiURL := "https://api.twitter.com/2/users/me"
+	resp, err := twitterAPIGet(apiURL, config, true)
+	if err != nil {
+		return "", fmt.Errorf("Twitter API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Twitter API error %d: %s", resp.StatusCode, truncateStr(string(body), 300))
+	}
+	var result struct {
+		Data struct {
+			ID       string `json:"id"`
+			Username string `json:"username"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("Twitter API decode error: %w", err)
+	}
+	cachedTwitterUserID = result.Data.ID
+	fmt.Printf("[siki] Twitter: authenticated as @%s (ID: %s)\n", result.Data.Username, result.Data.ID)
+	return cachedTwitterUserID, nil
+}
+
+// fetchTwitterTimeline retrieves the authenticated user's home timeline (last 12 hours).
+// Requires OAuth 1.0a (User Context authentication).
+func fetchTwitterTimeline(config *Config) ([]TwitterTweet, error) {
+	if !hasTwitterOAuth1a(config) {
+		return nil, fmt.Errorf("Twitter OAuth 1.0a credentials not configured (Consumer Key/Secret + Access Token/Secret required for timeline)")
+	}
+
+	userID, err := fetchTwitterUserID(config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build request: reverse chronological timeline with media expansion
+	startTime := time.Now().Add(-12 * time.Hour).UTC().Format(time.RFC3339)
+	apiURL := fmt.Sprintf("https://api.twitter.com/2/users/%s/timelines/reverse_chronological?max_results=100&start_time=%s&tweet.fields=created_at,author_id,text,entities,attachments,public_metrics&expansions=author_id,attachments.media_keys&user.fields=username,name,profile_image_url&media.fields=type,url,preview_image_url,variants",
+		userID, url.QueryEscape(startTime))
+
+	resp, err := twitterAPIGet(apiURL, config, true)
+	if err != nil {
+		return nil, fmt.Errorf("Twitter timeline request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Twitter API error %d: %s", resp.StatusCode, truncateStr(string(body), 500))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	tweets := parseTwitterResponse(body)
+	fmt.Printf("[siki] Twitter: fetched %d tweets from timeline\n", len(tweets))
+	return tweets, nil
+}
+
+// parseTwitterResponse parses a Twitter API v2 response with user and media expansions.
+func parseTwitterResponse(body []byte) []TwitterTweet {
+	var apiResp struct {
+		Data []struct {
+			ID          string `json:"id"`
+			Text        string `json:"text"`
+			CreatedAt   string `json:"created_at"`
+			AuthorID    string `json:"author_id"`
+			Attachments struct {
+				MediaKeys []string `json:"media_keys"`
+			} `json:"attachments"`
+			Entities struct {
+				URLs []struct {
+					ExpandedURL string `json:"expanded_url"`
+					DisplayURL  string `json:"display_url"`
+				} `json:"urls"`
+			} `json:"entities"`
+			PublicMetrics struct {
+				ReplyCount   int `json:"reply_count"`
+				RetweetCount int `json:"retweet_count"`
+				LikeCount    int `json:"like_count"`
+			} `json:"public_metrics"`
+		} `json:"data"`
+		Includes struct {
+			Users []struct {
+				ID              string `json:"id"`
+				Name            string `json:"name"`
+				Username        string `json:"username"`
+				ProfileImageURL string `json:"profile_image_url"`
+			} `json:"users"`
+			Media []struct {
+				MediaKey        string `json:"media_key"`
+				Type            string `json:"type"`
+				URL             string `json:"url"`
+				PreviewImageURL string `json:"preview_image_url"`
+				Variants        []struct {
+					ContentType string `json:"content_type"`
+					URL         string `json:"url"`
+					BitRate     int    `json:"bit_rate"`
+				} `json:"variants"`
+			} `json:"media"`
+		} `json:"includes"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return nil
+	}
+
+	// Build user ID → display name map and profile image map
+	userMap := map[string]string{}
+	userIconMap := map[string]string{}
+	for _, u := range apiResp.Includes.Users {
+		userMap[u.ID] = fmt.Sprintf("%s (@%s)", u.Name, u.Username)
+		if u.ProfileImageURL != "" {
+			userIconMap[u.ID] = u.ProfileImageURL
+		}
+	}
+
+	// Build media key → TwitterMedia map
+	mediaMap := map[string]TwitterMedia{}
+	for _, m := range apiResp.Includes.Media {
+		tm := TwitterMedia{Type: m.Type, PreviewURL: m.PreviewImageURL}
+		if m.URL != "" {
+			tm.URL = m.URL
+		} else if m.PreviewImageURL != "" {
+			tm.URL = m.PreviewImageURL
+		}
+		// For video/animated_gif, find the best mp4 variant
+		if m.Type == "video" || m.Type == "animated_gif" {
+			bestBitrate := 0
+			for _, v := range m.Variants {
+				if v.ContentType == "video/mp4" && v.BitRate >= bestBitrate {
+					tm.URL = v.URL
+					bestBitrate = v.BitRate
+				}
+			}
+		}
+		mediaMap[m.MediaKey] = tm
+	}
+
+	// Build tweets
+	var tweets []TwitterTweet
+	for _, d := range apiResp.Data {
+		t := TwitterTweet{
+			ID:              d.ID,
+			Text:            d.Text,
+			CreatedAt:       d.CreatedAt,
+			AuthorID:        d.AuthorID,
+			Author:          userMap[d.AuthorID],
+			ProfileImageURL: userIconMap[d.AuthorID],
+			ReplyCount:      d.PublicMetrics.ReplyCount,
+			RetweetCount:    d.PublicMetrics.RetweetCount,
+			LikeCount:       d.PublicMetrics.LikeCount,
+		}
+		if t.Author == "" {
+			t.Author = d.AuthorID
+		}
+		// Attach media
+		for _, mk := range d.Attachments.MediaKeys {
+			if m, ok := mediaMap[mk]; ok {
+				t.Media = append(t.Media, m)
+			}
+		}
+		// Collect expanded URLs (skip twitter internal pic/video URLs)
+		for _, u := range d.Entities.URLs {
+			if u.ExpandedURL != "" && !strings.Contains(u.ExpandedURL, "twitter.com/") && !strings.Contains(u.ExpandedURL, "x.com/") {
+				t.URLs = append(t.URLs, u.ExpandedURL)
+			}
+		}
+		tweets = append(tweets, t)
+	}
+	return tweets
+}
+
+// filterAndSummarizeTwitter uses LLM to extract AI-related tweets and summarize them as HTML.
+// formatTweets renders tweets as markdown with media and URL embeds.
+// filterTweetsByIntent uses LLM to judge each tweet's relevance to the user's intent.
+// Processes tweets in batches for efficiency. Returns only relevant tweets.
+func filterTweetsByIntent(tweets []TwitterTweet, intent string, config *Config, sendEvent ...func(StreamEvent)) []TwitterTweet {
+	if len(tweets) == 0 {
+		return nil
+	}
+	fmt.Printf("[siki] Filtering %d tweets by intent: %q\n", len(tweets), intent)
+
+	var emit func(StreamEvent)
+	if len(sendEvent) > 0 {
+		emit = sendEvent[0]
+	}
+
+	truncText := func(s string, n int) string {
+		r := []rune(s)
+		if len(r) > n {
+			return string(r[:n]) + "..."
+		}
+		return s
+	}
+
+	// Phase 1: LLMでintentからキーワードを抽出（1回だけ）
+	if emit != nil {
+		emit(StreamEvent{Type: "progress", Content: "キーワード抽出中..."})
+	}
+	kwPrompt := fmt.Sprintf(`Generate 20 search keywords for filtering tweets about: %s
+IMPORTANT: Output BOTH Japanese AND English keywords. At least 8 Japanese, at least 8 English.
+Example for "AI news": AI, 人工知能, machine learning, 機械学習, deep learning, 深層学習, LLM, 大規模言語モデル, GPT, ニューラルネット, robot, ロボット, 自動化, automation, データ, data science, 開発, research, モデル, tech
+Output comma-separated keywords only:`, intent)
+	kwResp, err := callFastModel(kwPrompt, config)
+	var keywords []string
+	if err == nil {
+		for _, kw := range strings.Split(kwResp, ",") {
+			kw = strings.TrimSpace(strings.ToLower(kw))
+			if kw != "" && len([]rune(kw)) >= 2 {
+				keywords = append(keywords, kw)
+			}
+		}
+	}
+	// intentの単語自体もキーワードに含める（LLMが出さなかった場合の保険）
+	for _, w := range strings.Fields(strings.ToLower(intent)) {
+		if len([]rune(w)) >= 2 {
+			found := false
+			for _, kw := range keywords {
+				if kw == w {
+					found = true
+					break
+				}
+			}
+			if !found {
+				keywords = append(keywords, w)
+			}
+		}
+	}
+	if len(keywords) == 0 {
+		keywords = []string{strings.ToLower(intent)}
+	}
+	if emit != nil {
+		emit(StreamEvent{Type: "progress", Content: fmt.Sprintf("キーワード: %s", strings.Join(keywords, ", "))})
+	}
+	fmt.Printf("[siki] Filter keywords: %v\n", keywords)
+
+	// Phase 2: 全ツイートをキーワードマッチで即座に判定（1件ずつ表示）
+	var relevant []TwitterTweet
+	for i, tw := range tweets {
+		lower := strings.ToLower(tw.Text + " " + tw.Author)
+		matched := ""
+		for _, kw := range keywords {
+			if strings.Contains(lower, kw) {
+				matched = kw
+				break
+			}
+		}
+		preview := truncText(strings.ReplaceAll(tw.Text, "\n", " "), 40)
+		if matched != "" {
+			relevant = append(relevant, tw)
+			if emit != nil {
+				emit(StreamEvent{Type: "progress", Content: fmt.Sprintf("(%d/%d) ✓ %s [%s]", i+1, len(tweets), preview, matched)})
+			}
+		} else {
+			if emit != nil {
+				emit(StreamEvent{Type: "progress", Content: fmt.Sprintf("(%d/%d) ✗ %s", i+1, len(tweets), preview)})
+			}
+		}
+	}
+
+	if emit != nil {
+		emit(StreamEvent{Type: "progress", Content: fmt.Sprintf("選別完了: %d/%d件を抽出", len(relevant), len(tweets))})
+	}
+	fmt.Printf("[siki] Filtered: %d/%d tweets matched intent\n", len(relevant), len(tweets))
+	return relevant
+}
+
+// fetchConversationThread retrieves reply threads for a tweet using Twitter API.
+// Uses conversation_id search if available (requires Basic tier), otherwise returns nil.
+func fetchConversationThread(tweetID string, authorHandle string, config *Config) ([]TwitterTweet, error) {
+	// Get the tweet's conversation_id
+	infoURL := fmt.Sprintf("https://api.twitter.com/2/tweets/%s?tweet.fields=conversation_id", tweetID)
+	resp, err := twitterAPIGet(infoURL, config, hasTwitterOAuth1a(config))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("tweet info error %d: %s", resp.StatusCode, truncateStr(string(body), 200))
+	}
+	var infoResp struct {
+		Data struct {
+			ConversationID string `json:"conversation_id"`
+		} `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&infoResp)
+	convID := infoResp.Data.ConversationID
+	if convID == "" {
+		convID = tweetID
+	}
+
+	// Try search for conversation replies (requires Basic tier)
+	searchURL := fmt.Sprintf("https://api.twitter.com/2/tweets/search/recent?query=conversation_id:%s&max_results=100&tweet.fields=created_at,author_id,text,entities,attachments,public_metrics&expansions=author_id,attachments.media_keys&user.fields=username,name,profile_image_url&media.fields=type,url,preview_image_url,variants&sort_order=chronological",
+		convID)
+
+	resp2, err := twitterAPIGet(searchURL, config, hasTwitterOAuth1a(config))
+	if err != nil {
+		return nil, err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		// Search API not available (free tier) — return nil gracefully
+		fmt.Printf("[siki] Thread search unavailable (status %d) for tweet %s — skipping\n", resp2.StatusCode, tweetID)
+		return nil, nil
+	}
+	body, _ := io.ReadAll(resp2.Body)
+	thread := parseTwitterResponse(body)
+
+	// Filter out the original tweet to avoid duplication
+	var replies []TwitterTweet
+	for _, t := range thread {
+		if t.ID != tweetID {
+			replies = append(replies, t)
+		}
+	}
+	fmt.Printf("[siki] Thread for tweet %s: %d replies\n", tweetID, len(replies))
+	return replies, nil
+}
+
+// selectTweetsForDeepDive asks LLM which filtered tweets deserve thread expansion.
+func selectTweetsForDeepDive(tweets []TwitterTweet, intent string, config *Config) []int {
+	if len(tweets) == 0 {
+		return nil
+	}
+
+	var sb strings.Builder
+	for i, tw := range tweets {
+		sb.WriteString(fmt.Sprintf("[%d] @%s: %s\n", i, tw.Author, tw.Text))
+	}
+
+	prompt := fmt.Sprintf(`Select up to 3 tweets that are most important and worth reading thread replies for topic "%s".
+Output only the numbers comma-separated. If none worth deep-diving, output "none".
+
+Tweets:
+%s
+
+Numbers:`, intent, sb.String())
+
+	resp, err := callFastModel(prompt, config)
+	if err != nil {
+		return nil
+	}
+	resp = strings.TrimSpace(resp)
+	if resp == "なし" || resp == "none" || resp == "" {
+		return nil
+	}
+
+	var indices []int
+	for _, numStr := range strings.Split(resp, ",") {
+		cleaned := ""
+		for _, c := range strings.TrimSpace(numStr) {
+			if c >= '0' && c <= '9' {
+				cleaned += string(c)
+			}
+		}
+		if cleaned == "" {
+			continue
+		}
+		idx := 0
+		for _, c := range cleaned {
+			idx = idx*10 + int(c-'0')
+		}
+		if idx >= 0 && idx < len(tweets) {
+			indices = append(indices, idx)
+		}
+		if len(indices) >= 3 {
+			break
+		}
+	}
+	return indices
+}
+
+// evaluateAndSelectDeepDive evaluates each filtered tweet's importance and
+// whether it's worth deep-diving, emitting per-tweet progress events.
+func evaluateAndSelectDeepDive(tweets []TwitterTweet, intent string, config *Config, sendEvent func(StreamEvent)) []int {
+	if len(tweets) == 0 {
+		return nil
+	}
+
+	truncText := func(s string, n int) string {
+		r := []rune(strings.ReplaceAll(s, "\n", " "))
+		if len(r) > n {
+			return string(r[:n]) + "..."
+		}
+		return string(r)
+	}
+
+	// Build tweet list for LLM (include reply count as signal)
+	var sb strings.Builder
+	for i, tw := range tweets {
+		text := strings.ReplaceAll(tw.Text, "\n", " ")
+		metrics := ""
+		if tw.ReplyCount > 0 || tw.LikeCount > 0 {
+			metrics = fmt.Sprintf(" [💬%d ❤%d]", tw.ReplyCount, tw.LikeCount)
+		}
+		sb.WriteString(fmt.Sprintf("[%d] @%s: %s%s\n", i, tw.Author, text, metrics))
+	}
+
+	prompt := fmt.Sprintf(`Rate each tweet's importance for topic "%s" and decide if thread replies should be fetched.
+Tweets with many replies (💬) are good DIVE candidates.
+Format per line: number|HIGH or MID or LOW|DIVE or SKIP|reason(10 words max)
+Example:
+0|HIGH|DIVE|Major AI model release announcement
+1|MID|SKIP|General opinion about tech
+2|LOW|SKIP|Only tangentially related
+
+Tweets:
+%s
+
+Ratings:`, intent, sb.String())
+
+	fmt.Printf("[siki] evaluateAndSelectDeepDive: %d tweets, intent=%q\n", len(tweets), intent)
+	// Need ~20 tokens per tweet line output
+	maxTokens := len(tweets)*25 + 50
+	if maxTokens < 300 {
+		maxTokens = 300
+	}
+	resp, err := callFastModel(prompt, config, maxTokens)
+	if err != nil {
+		fmt.Printf("[siki] evaluateAndSelectDeepDive: callFastModel error: %v\n", err)
+		if sendEvent != nil {
+			sendEvent(StreamEvent{Type: "progress", Content: "評価失敗、デフォルト選定に切替..."})
+		}
+		return selectTweetsForDeepDive(tweets, intent, config)
+	}
+	fmt.Printf("[siki] evaluateAndSelectDeepDive: LFM2.5 response (%d bytes):\n%s\n", len(resp), resp)
+
+	var diveIndices []int
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 4)
+		if len(parts) < 3 {
+			continue
+		}
+		// Parse index
+		cleaned := ""
+		for _, c := range strings.TrimSpace(parts[0]) {
+			if c >= '0' && c <= '9' {
+				cleaned += string(c)
+			}
+		}
+		if cleaned == "" {
+			continue
+		}
+		idx := 0
+		for _, c := range cleaned {
+			idx = idx*10 + int(c-'0')
+		}
+		if idx < 0 || idx >= len(tweets) {
+			continue
+		}
+
+		importance := strings.TrimSpace(strings.ToUpper(parts[1]))
+		dive := strings.TrimSpace(strings.ToUpper(parts[2]))
+		reason := ""
+		if len(parts) >= 4 {
+			reason = strings.TrimSpace(parts[3])
+		}
+
+		tw := tweets[idx]
+		preview := truncText(tw.Text, 30)
+
+		// Build progress message
+		var icon string
+		switch {
+		case strings.Contains(importance, "HIGH"):
+			icon = "🔴"
+		case strings.Contains(importance, "MID"):
+			icon = "🟡"
+		default:
+			icon = "⚪"
+		}
+		diveLabel := ""
+		if strings.Contains(dive, "DIVE") {
+			diveLabel = " → 深掘り"
+			diveIndices = append(diveIndices, idx)
+		}
+		msg := fmt.Sprintf("%s %s @%s: %s", icon, importance, tw.Author, preview)
+		if reason != "" {
+			msg += " (" + reason + ")"
+		}
+		msg += diveLabel
+		if sendEvent != nil {
+			sendEvent(StreamEvent{Type: "progress", Content: msg})
+		}
+	}
+
+	// Also auto-DIVE tweets with many replies (>= 3) that LLM didn't flag
+	diveSet := map[int]bool{}
+	for _, idx := range diveIndices {
+		diveSet[idx] = true
+	}
+	for i, tw := range tweets {
+		if !diveSet[i] && tw.ReplyCount >= 3 {
+			diveIndices = append(diveIndices, i)
+			diveSet[i] = true
+			if sendEvent != nil {
+				preview := truncText(strings.ReplaceAll(tw.Text, "\n", " "), 30)
+				sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("💬 %d件のリプライ → 深掘り追加: @%s: %s", tw.ReplyCount, tw.Author, preview)})
+			}
+		}
+	}
+
+	if sendEvent != nil {
+		if len(diveIndices) > 0 {
+			sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("深掘り対象: %d件", len(diveIndices))})
+		} else {
+			sendEvent(StreamEvent{Type: "progress", Content: "深掘り対象なし"})
+		}
+	}
+	return diveIndices
+}
+
+// formatOneTweet renders a single tweet as markdown.
+func formatOneTweet(tw TwitterTweet, indent string) string {
+	var sb strings.Builder
+	if tw.ProfileImageURL != "" {
+		sb.WriteString(fmt.Sprintf("%s<img src=\"%s\" width=\"32\" height=\"32\" style=\"border-radius:50%%;vertical-align:middle;margin-right:6px\"> **%s**\n%s%s\n", indent, tw.ProfileImageURL, tw.Author, indent, tw.Text))
+	} else {
+		sb.WriteString(fmt.Sprintf("%s**%s**\n%s%s\n", indent, tw.Author, indent, tw.Text))
+	}
+	for _, m := range tw.Media {
+		switch m.Type {
+		case "photo":
+			sb.WriteString(fmt.Sprintf("\n%s![image](%s)\n", indent, m.URL))
+		case "video", "animated_gif":
+			if m.PreviewURL != "" {
+				sb.WriteString(fmt.Sprintf("\n%s[![video](%s)](%s)\n", indent, m.PreviewURL, m.URL))
+			} else {
+				sb.WriteString(fmt.Sprintf("\n%s[▶ 動画](%s)\n", indent, m.URL))
+			}
+		}
+	}
+	for _, u := range tw.URLs {
+		sb.WriteString(fmt.Sprintf("\n%s🔗 %s\n", indent, u))
+	}
+	// Show engagement metrics if available
+	if tw.ReplyCount > 0 || tw.LikeCount > 0 || tw.RetweetCount > 0 {
+		sb.WriteString(fmt.Sprintf("\n%s💬%d 🔁%d ❤%d", indent, tw.ReplyCount, tw.RetweetCount, tw.LikeCount))
+	}
+	if tw.CreatedAt != "" {
+		sb.WriteString(fmt.Sprintf("\n%s*%s*", indent, tw.CreatedAt))
+	}
+	sb.WriteString(fmt.Sprintf(" [↗](https://x.com/i/status/%s)\n", tw.ID))
+	return sb.String()
+}
+
+// ThreadData holds thread replies for a specific tweet.
+type ThreadData struct {
+	TweetIndex int
+	Replies    []TwitterTweet
+}
+
+func formatTweets(tweets []TwitterTweet, title string) string {
+	return formatTweetsWithThreads(tweets, title, nil)
+}
+
+func formatTweetsWithThreads(tweets []TwitterTweet, title string, threads []ThreadData) string {
+	// Build thread map: tweet index -> replies
+	threadMap := map[int][]TwitterTweet{}
+	for _, td := range threads {
+		threadMap[td.TweetIndex] = td.Replies
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s\n\n", title))
+	for i, tw := range tweets {
+		sb.WriteString(fmt.Sprintf("### %d. ", i+1))
+		sb.WriteString(formatOneTweet(tw, ""))
+
+		// Render thread if available
+		if replies, ok := threadMap[i]; ok && len(replies) > 0 {
+			sb.WriteString(fmt.Sprintf("\n<details><summary>🧵 スレッド (%d件の返信)</summary>\n\n", len(replies)))
+			for _, r := range replies {
+				sb.WriteString(formatOneTweet(r, "> "))
+				sb.WriteString("\n")
+			}
+			sb.WriteString("</details>\n")
+		}
+		sb.WriteString("\n---\n\n")
+	}
+	return sb.String()
+}
+
+func filterAndSummarizeTwitter(tweets []TwitterTweet, config *Config) (string, error) {
+	if len(tweets) == 0 {
+		return "", nil
+	}
+
+	// Build tweet text for LLM
+	var sb strings.Builder
+	for _, t := range tweets {
+		sb.WriteString(fmt.Sprintf("[%s] %s: %s\n\n", t.CreatedAt, t.Author, t.Text))
+	}
+
+	prompt := fmt.Sprintf(`以下はTwitterタイムラインの%d件のツイートです。
+AI・機械学習・LLM・大規模言語モデル・テクノロジー・プログラミングに関連するツイートのみ抽出し、重要度順にまとめてください。
+
+## ツイート:
+%s
+
+## ルール:
+- AI/ML/LLM/テクノロジーに関連するもののみ抽出
+- 各項目に元のツイート著者名を含めること
+- ツイートに含まれるURLはそのまま<a href>で残すこと
+- HTML形式（<h3>, <p>, <a>タグ使用）で出力
+- 関連ツイートが1件もない場合は「該当なし」とだけ出力
+- 日本語で出力すること`, len(tweets), truncateStr(sb.String(), 8000))
+
+	_, result, err := callSubModel(prompt, config)
+	if err != nil {
+		return "", fmt.Errorf("Twitter summary LLM failed: %w", err)
+	}
+
+	result = strings.TrimSpace(result)
+	if result == "該当なし" || len(result) < 20 {
+		return "", nil
+	}
+	return result, nil
+}
+
+// twitterSearch searches Twitter using the v2 Recent Search API and returns formatted results.
+func twitterSearch(query string, maxResults int, config *Config) (string, error) {
+	if config.TwitterBearerToken == "" && !hasTwitterOAuth1a(config) {
+		return "", fmt.Errorf("Twitter認証が設定されていません。Settings → Twitter で設定してください。")
+	}
+	if maxResults <= 0 || maxResults > 100 {
+		maxResults = 30
+	}
+	if maxResults < 10 {
+		maxResults = 10
+	}
+
+	apiURL := fmt.Sprintf("https://api.twitter.com/2/tweets/search/recent?query=%s&max_results=%d&tweet.fields=created_at,author_id,text,public_metrics,entities,attachments&expansions=author_id,attachments.media_keys&user.fields=username,name,profile_image_url&media.fields=type,url,preview_image_url,variants",
+		url.QueryEscape(query), maxResults)
+
+	// Search endpoint works with both Bearer Token and OAuth 1.0a
+	resp, err := twitterAPIGet(apiURL, config, hasTwitterOAuth1a(config))
+	if err != nil {
+		return "", fmt.Errorf("Twitter API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Twitter API error %d: %s", resp.StatusCode, truncateStr(string(body), 500))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	tweets := parseTwitterResponse(body)
+	if len(tweets) == 0 {
+		return fmt.Sprintf("「%s」に関するツイートは見つかりませんでした。", query), nil
+	}
+
+	return formatTweets(tweets, fmt.Sprintf("Twitter検索結果: \"%s\" (%d件)", query, len(tweets))), nil
 }
 
 // EmailImage represents an inline image attachment for emails.
@@ -9515,8 +10978,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu126
-RUN pip install --no-cache-dir openai-whisper
-RUN mkdir -p /workspace
+RUN pip install --no-cache-dir openai-whisper transformers diffusers accelerate safetensors sentencepiece protobuf imageio imageio-ffmpeg ftfy
+RUN mkdir -p /workspace /workspace/output
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
 `
@@ -9588,12 +11051,17 @@ func ensureDockerContainer() error {
 	// Remove old stopped container if exists
 	exec.Command("docker", "rm", "-f", dockerContainerName).Run()
 
-	// Start new container with GPU access
+	// Start new container with GPU access, HF cache, shared memory
+	home, _ := os.UserHomeDir()
+	hfCacheDir := filepath.Join(home, ".cache", "huggingface")
+	os.MkdirAll(hfCacheDir, 0755)
 	fmt.Println("[siki] Starting Docker container siki-worker with GPU access...")
 	startCmd := exec.Command("docker", "run", "-d",
 		"--name", dockerContainerName,
 		"--gpus", "all",
+		"--shm-size=16g",
 		"-v", dockerWorkspaceDir+":/workspace",
+		"-v", hfCacheDir+":/root/.cache/huggingface",
 		dockerImageName,
 	)
 	startCmd.Stdout = os.Stdout
@@ -9631,6 +11099,567 @@ func stopDockerContainer() {
 	fmt.Println("[siki] Stopping Docker container siki-worker...")
 	exec.Command("docker", "stop", dockerContainerName).Run()
 	exec.Command("docker", "rm", dockerContainerName).Run()
+}
+
+// ============================================================================
+// Ollama VRAM Management (unload/reload for CUDA-heavy tasks)
+// ============================================================================
+
+// unloadOllamaModels queries ollama for loaded models, unloads them, and returns the list.
+func unloadOllamaModels(config *Config) []string {
+	ollamaEndpoint := "http://localhost:11434"
+	if config != nil && config.SubModelBackend == "ollama" {
+		ep := subModelEndpoint(config)
+		if ep != "" && strings.Contains(ep, "11434") {
+			ollamaEndpoint = strings.TrimSuffix(ep, "/v1")
+		}
+	}
+
+	// Get loaded models via /api/ps
+	var loadedModels []string
+	resp, err := http.Get(ollamaEndpoint + "/api/ps")
+	if err != nil {
+		fmt.Printf("[siki] Could not query ollama models: %v\n", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var psResp struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(body, &psResp) == nil {
+		for _, m := range psResp.Models {
+			loadedModels = append(loadedModels, m.Name)
+		}
+	}
+
+	if len(loadedModels) == 0 {
+		fmt.Println("[siki] No ollama models loaded, nothing to unload")
+		return nil
+	}
+
+	fmt.Printf("[siki] Unloading %d ollama model(s) to free VRAM: %v\n", len(loadedModels), loadedModels)
+	for _, model := range loadedModels {
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"model":    model,
+			"keep_alive": 0,
+		})
+		req, _ := http.NewRequest("POST", ollamaEndpoint+"/api/generate", bytes.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 10 * time.Second}
+		r, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[siki] Failed to unload %s: %v\n", model, err)
+		} else {
+			io.ReadAll(r.Body)
+			r.Body.Close()
+			fmt.Printf("[siki] Unloaded ollama model: %s\n", model)
+		}
+	}
+	time.Sleep(2 * time.Second) // Allow VRAM to stabilize
+	return loadedModels
+}
+
+// reloadOllamaModels reloads previously unloaded models in the background.
+func reloadOllamaModels(models []string, config *Config) {
+	if len(models) == 0 {
+		return
+	}
+	ollamaEndpoint := "http://localhost:11434"
+	if config != nil && config.SubModelBackend == "ollama" {
+		ep := subModelEndpoint(config)
+		if ep != "" && strings.Contains(ep, "11434") {
+			ollamaEndpoint = strings.TrimSuffix(ep, "/v1")
+		}
+	}
+
+	fmt.Printf("[siki] Reloading %d ollama model(s): %v\n", len(models), models)
+	for _, model := range models {
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"model":      model,
+			"prompt":     "Say OK.",
+			"keep_alive": -1,
+			"stream":     false,
+			"options":    map[string]interface{}{"num_predict": 1},
+		})
+		req, _ := http.NewRequest("POST", ollamaEndpoint+"/api/generate", bytes.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 120 * time.Second}
+		r, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[siki] Failed to reload %s: %v\n", model, err)
+		} else {
+			io.ReadAll(r.Body)
+			r.Body.Close()
+			fmt.Printf("[siki] Reloaded ollama model: %s\n", model)
+		}
+	}
+}
+
+// ============================================================================
+// Docker Run Model — Run HuggingFace/GitHub models in Docker GPU environment
+// ============================================================================
+
+// dockerRunModel fetches a model's README, generates a Python script, and runs it in Docker.
+// Flow: README取得 → ollama解放 → Docker起動 → 環境構築 → 利用可能クラス取得 → コード生成 → 実行(リトライ付き)
+func dockerRunModel(modelURL, userPrompt string, config *Config, sendEvent ...func(StreamEvent)) (string, error) {
+	emit := func(msg string) {
+		fmt.Printf("[siki] docker_run_model: %s\n", msg)
+		if len(sendEvent) > 0 && sendEvent[0] != nil {
+			sendEvent[0](StreamEvent{Type: "thinking", Content: msg})
+		}
+	}
+	emitContent := func(msg string) {
+		if len(sendEvent) > 0 && sendEvent[0] != nil {
+			sendEvent[0](StreamEvent{Type: "content", Content: msg})
+		}
+	}
+
+	// ========================================================================
+	// Phase 1: README取得（LLM不要、ネットワークのみ）
+	// ========================================================================
+	emit(fmt.Sprintf("🔗 モデルページを取得中: %s", modelURL))
+
+	title, readmeText, _, err := scraplingFetch(modelURL, 15000, false)
+	if err != nil || len(readmeText) < 50 {
+		emit("Scrapling失敗、直接HTTPで再取得中...")
+		a := &Agent{config: config}
+		readmeText, err = a.webFetchQuick(modelURL)
+		if err != nil {
+			return "", fmt.Errorf("モデルページの取得に失敗: %w", err)
+		}
+		title = modelURL
+	}
+	if len(readmeText) > 6000 {
+		readmeText = readmeText[:6000]
+	}
+	emit(fmt.Sprintf("📄 取得完了: %s (%d文字)", title, len(readmeText)))
+
+	// ========================================================================
+	// Phase 2: VRAM確保 + Docker環境構築（コード生成の前にやる）
+	// ========================================================================
+	emit("🧹 VRAM確保のためollamaモデルをアンロード中...")
+	unloadedModels := unloadOllamaModels(config)
+	if len(unloadedModels) > 0 {
+		emit(fmt.Sprintf("✅ %d個のモデルをアンロード: %s", len(unloadedModels), strings.Join(unloadedModels, ", ")))
+	} else {
+		emit("ℹ️ アンロード対象のollamaモデルなし")
+	}
+
+	emit("🐳 DockerコンテナをGPU付きで起動中...")
+	if err := ensureDockerContainer(); err != nil {
+		go reloadOllamaModels(unloadedModels, config)
+		return "", fmt.Errorf("Dockerコンテナが利用不可: %w", err)
+	}
+	emit("✅ Dockerコンテナ準備完了")
+
+	// Create output directory
+	dockerExec("mkdir -p /workspace/output", 30)
+
+	// ========================================================================
+	// Phase 3: Docker内のML環境を最新化し、利用可能クラスを取得
+	// ========================================================================
+	emit("📦 diffusersを最新版にアップグレード中...")
+	upgradeOut, upgradeErr := dockerExec("pip install --no-cache-dir --upgrade git+https://github.com/huggingface/diffusers.git transformers accelerate 2>&1 | tail -5", 600)
+	if upgradeErr != nil {
+		emit(fmt.Sprintf("⚠️ diffusersアップグレード警告: %v", upgradeErr))
+	} else {
+		emit(fmt.Sprintf("✅ diffusersアップグレード完了: %s", truncateStr(upgradeOut, 200)))
+	}
+
+	// Query available Pipeline classes — this gives the LLM accurate info for code gen
+	emit("🔍 利用可能なPipelineクラスを確認中...")
+	availClasses, _ := dockerExec(`python3 -c "import diffusers; print([x for x in dir(diffusers) if 'Pipeline' in x])" 2>&1`, 30)
+	availClasses = strings.TrimSpace(availClasses)
+	emit(fmt.Sprintf("📋 利用可能クラス: %s", truncateStr(availClasses, 500)))
+
+	// Also check for model-specific classes (e.g. LTX for LTX-2.3)
+	modelHint := ""
+	lowerURL := strings.ToLower(modelURL)
+	if strings.Contains(lowerURL, "ltx") {
+		ltxClasses, _ := dockerExec(`python3 -c "import diffusers; print([x for x in dir(diffusers) if 'LTX' in x])" 2>&1`, 30)
+		if strings.TrimSpace(ltxClasses) != "" && !strings.Contains(ltxClasses, "Error") {
+			modelHint = fmt.Sprintf("\n\n## このモデルに関連するクラス:\n%s", strings.TrimSpace(ltxClasses))
+		}
+	} else if strings.Contains(lowerURL, "flux") {
+		fluxClasses, _ := dockerExec(`python3 -c "import diffusers; print([x for x in dir(diffusers) if 'Flux' in x])" 2>&1`, 30)
+		if strings.TrimSpace(fluxClasses) != "" && !strings.Contains(fluxClasses, "Error") {
+			modelHint = fmt.Sprintf("\n\n## このモデルに関連するクラス:\n%s", strings.TrimSpace(fluxClasses))
+		}
+	} else if strings.Contains(lowerURL, "stable") || strings.Contains(lowerURL, "sdxl") {
+		sdClasses, _ := dockerExec(`python3 -c "import diffusers; print([x for x in dir(diffusers) if 'Stable' in x or 'SDXL' in x])" 2>&1`, 30)
+		if strings.TrimSpace(sdClasses) != "" && !strings.Contains(sdClasses, "Error") {
+			modelHint = fmt.Sprintf("\n\n## このモデルに関連するクラス:\n%s", strings.TrimSpace(sdClasses))
+		}
+	}
+
+	// Check installed torch/CUDA version for the prompt
+	torchInfo, _ := dockerExec(`python3 -c "import torch; print(f'torch={torch.__version__}, cuda={torch.cuda.is_available()}, device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')" 2>&1`, 15)
+	torchInfo = strings.TrimSpace(torchInfo)
+
+	// ========================================================================
+	// Phase 4: 環境情報を含めてPythonコード生成
+	// ========================================================================
+	emit("🧠 READMEと環境情報を元にPythonスクリプトを生成中...")
+	codePrompt := fmt.Sprintf(`以下のモデルページの情報とDocker実行環境の情報を参考に、Pythonスクリプトを生成せよ。
+
+## モデルURL: %s
+## ユーザーリクエスト: %s
+
+## モデルページの内容:
+%s
+
+## Docker実行環境の情報:
+- %s
+- 利用可能なdiffusers Pipelineクラス一覧: %s%s
+
+## 要件:
+- 出力ファイルは必ず /workspace/output/ ディレクトリに保存すること
+- 画像の場合: /workspace/output/result.png
+- 動画の場合: /workspace/output/result.mp4 （exportメソッドやimageio等で保存）
+- テキストの場合: /workspace/output/result.txt
+- CUDAを使用すること（torch.device("cuda")）
+- メモリ節約のため torch.bfloat16 または torch.float16 を使うこと
+- enable_model_cpu_offload() を使ってVRAM節約すること
+- import文から始めて、完全に動作するスクリプトにすること
+- os.makedirs("/workspace/output", exist_ok=True) を最初に呼ぶこと
+- 必要なpipパッケージがあれば、スクリプト冒頭にコメントで # pip: package1 package2 と書くこと
+
+重要:
+- 上記の「利用可能なPipelineクラス一覧」に含まれるクラス名のみを使うこと！存在しないクラスをimportしないこと！
+- READMEにdiffusersの使用例コードがあれば、それを優先して参考にすること
+- Pythonコードのみ出力。説明不要、コードフェンスも不要。`, modelURL, userPrompt, readmeText, torchInfo, availClasses, modelHint)
+
+	_, pythonCode, err := callSubModelWith(codePrompt, config, "", 5*time.Minute)
+	if err != nil {
+		altModel := pickRetryModel(config, 1)
+		emit(fmt.Sprintf("⚠️ デフォルトモデルがタイムアウト。%s で再試行中...", altModel))
+		_, pythonCode, err = callSubModelWith(codePrompt, config, altModel, 5*time.Minute)
+		if err != nil {
+			go reloadOllamaModels(unloadedModels, config)
+			return "", fmt.Errorf("Pythonスクリプトの生成に失敗（両モデル）: %w", err)
+		}
+	}
+
+	pythonCode = cleanCodeFences(pythonCode)
+
+	codeLines := strings.Count(pythonCode, "\n") + 1
+	emit(fmt.Sprintf("✅ スクリプト生成完了 (%d行, %dバイト)", codeLines, len(pythonCode)))
+	preview := pythonCode
+	if lines := strings.SplitN(preview, "\n", 8); len(lines) > 7 {
+		preview = strings.Join(lines[:7], "\n") + "\n..."
+	}
+	emitContent("\n```python\n" + preview + "\n```\n")
+
+	// ========================================================================
+	// Phase 5: 依存パッケージのインストール + 実行（リトライ付き）
+	// ========================================================================
+
+	// Extract pip deps from # pip: comments
+	var pipDeps []string
+	for _, line := range strings.Split(pythonCode, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# pip:") {
+			deps := strings.TrimPrefix(line, "# pip:")
+			for _, d := range strings.Fields(deps) {
+				pipDeps = append(pipDeps, d)
+			}
+		}
+	}
+
+	// Write script
+	scriptPath := filepath.Join(dockerWorkspaceDir, "run_model.py")
+	if err := os.WriteFile(scriptPath, []byte(pythonCode), 0644); err != nil {
+		go reloadOllamaModels(unloadedModels, config)
+		return "", fmt.Errorf("スクリプト書き込み失敗: %w", err)
+	}
+
+	// Install pip dependencies
+	if len(pipDeps) > 0 {
+		emit(fmt.Sprintf("📦 依存パッケージをインストール中: %s", strings.Join(pipDeps, ", ")))
+		installCmd := "pip install --no-cache-dir " + strings.Join(pipDeps, " ")
+		out, installErr := dockerExec(installCmd, 300)
+		if installErr != nil {
+			emit(fmt.Sprintf("⚠️ pip install 警告: %v", installErr))
+			fmt.Printf("[siki] pip install output: %s\n", out)
+		} else {
+			emit("✅ 依存パッケージインストール完了")
+		}
+	}
+
+	// Run script with aggressive auto-fix retries
+	const maxRetries = 10
+	currentCode := pythonCode
+	var output string
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt == 0 {
+			emit("🚀 Docker内でPythonスクリプトを実行中（最大10分）...")
+		} else {
+			emit(fmt.Sprintf("🚀 修正版スクリプトを実行中（リトライ %d/%d）...", attempt, maxRetries))
+		}
+
+		output, err = dockerExec("cd /workspace && python3 run_model.py 2>&1", 600)
+
+		if len(output) > 0 {
+			outPreview := truncateStr(output, 1000)
+			emit(fmt.Sprintf("📋 実行出力:\n%s", outPreview))
+		}
+
+		// Check success
+		hasTraceback := strings.Contains(output, "Traceback") || strings.Contains(output, "Error:")
+		hasOutput := fileExistsInDocker("/workspace/output/")
+		if err == nil && (!hasTraceback || hasOutput) {
+			emit("✅ スクリプト実行成功!")
+			break
+		}
+
+		if attempt >= maxRetries {
+			emit(fmt.Sprintf("❌ %d回リトライしたが成功しなかった", maxRetries))
+			break
+		}
+
+		emit(fmt.Sprintf("❌ エラー発生（試行 %d/%d）。エラーを分析して修正中...", attempt+1, maxRetries+1))
+
+		// Extract pip install commands from error output
+		pkgSet := map[string]bool{}
+		for _, line := range strings.Split(output, "\n") {
+			line = strings.TrimSpace(line)
+
+			// "pip install xxx yyy zzz"
+			if idx := strings.Index(line, "pip install"); idx >= 0 {
+				pkgStr := line[idx+len("pip install"):]
+				pkgStr = strings.TrimPrefix(pkgStr, " --no-cache-dir")
+				for _, pkg := range strings.Fields(pkgStr) {
+					pkg = strings.Trim(pkg, "`,.'\"")
+					if pkg != "" && pkg != "pip" && !strings.HasPrefix(pkg, "-") {
+						pkgSet[pkg] = true
+					}
+				}
+			}
+
+			// "No module named 'xxx'"
+			if strings.Contains(line, "No module named") {
+				if qi := strings.Index(line, "'"); qi >= 0 {
+					mod := line[qi+1:]
+					if qe := strings.Index(mod, "'"); qe >= 0 {
+						mod = strings.Split(mod[:qe], ".")[0]
+						pkgSet[mod] = true
+					}
+				}
+			}
+
+			// "cannot import name 'Xxx' from 'diffusers'" → upgrade diffusers
+			if strings.Contains(line, "cannot import name") && strings.Contains(line, "from 'diffusers'") {
+				pkgSet["git+https://github.com/huggingface/diffusers.git"] = true
+			}
+
+			// CUDA OOM → add cpu_offload hint for retry
+			if strings.Contains(line, "CUDA out of memory") || strings.Contains(line, "cudaErrorMemoryAllocation") {
+				// Will be handled in retry prompt below
+			}
+		}
+
+		// Run pip install for detected packages
+		if len(pkgSet) > 0 {
+			var pkgs []string
+			for p := range pkgSet {
+				pkgs = append(pkgs, p)
+			}
+			installCmd := "pip install --no-cache-dir " + strings.Join(pkgs, " ")
+			emit(fmt.Sprintf("📦 エラーから検出したパッケージをインストール: %s", strings.Join(pkgs, ", ")))
+			pipOut, pipErr := dockerExec(installCmd, 300)
+			if pipErr != nil {
+				emit(fmt.Sprintf("⚠️ pip install エラー: %v", pipErr))
+			}
+			if len(pipOut) > 0 {
+				emit(fmt.Sprintf("📦 pip出力: %s", truncateStr(pipOut, 300)))
+			}
+
+			// Re-run same script after installing packages
+			emit("🔄 パッケージインストール後、同じスクリプトを再実行...")
+			output, err = dockerExec("cd /workspace && python3 run_model.py 2>&1", 600)
+			if len(output) > 0 {
+				emit(fmt.Sprintf("📋 再実行出力:\n%s", truncateStr(output, 1000)))
+			}
+			hasTraceback = strings.Contains(output, "Traceback") || strings.Contains(output, "Error:")
+			hasOutput = fileExistsInDocker("/workspace/output/")
+			if err == nil && (!hasTraceback || hasOutput) {
+				emit("✅ パッケージインストール後に成功!")
+				break
+			}
+		}
+
+		// Re-query available classes (may have changed after pip install)
+		freshClasses, _ := dockerExec(`python3 -c "import diffusers; print([x for x in dir(diffusers) if 'Pipeline' in x])" 2>&1`, 30)
+
+		// Build CUDA OOM hint if applicable
+		oomHint := ""
+		if strings.Contains(output, "CUDA out of memory") || strings.Contains(output, "cudaErrorMemoryAllocation") {
+			oomHint = `
+- CUDA OOMが発生している。以下の対策を全て適用せよ:
+  - pipe.enable_model_cpu_offload() を使え（pipe.to("cuda")の代わりに）
+  - torch.bfloat16 を使え
+  - enable_attention_slicing() があれば使え
+  - 解像度/フレーム数を下げよ（画像: 512x512以下、動画: 短く）`
+		}
+
+		// Ask alternate LLM to fix the code
+		altModel := pickRetryModel(config, attempt+1)
+		emit(fmt.Sprintf("🔄 %s にエラーを渡してスクリプトを修正中...", altModel))
+
+		retryPrompt := fmt.Sprintf(`Pythonスクリプトがエラーになった。修正した完全なスクリプトを出力せよ。
+
+## エラー出力:
+%s
+
+## 元のスクリプト:
+%s
+
+## Docker環境で利用可能なdiffusersのPipelineクラス:
+%s
+
+修正ルール:
+- エラーの原因を特定して修正せよ
+- ImportErrorの場合、上記の利用可能クラス一覧から正しいクラス名を使え
+- 存在しないクラスを使うな！利用可能クラス一覧にあるもののみ使え！%s
+- 出力先は /workspace/output/ を維持
+- os.makedirs("/workspace/output", exist_ok=True) を最初に呼べ
+- Pythonコードのみ出力。説明不要、コードフェンスも不要。`, truncateStr(output, 2000), currentCode, truncateStr(freshClasses, 500), oomHint)
+
+		_, retryCode, retryErr := callSubModelWith(retryPrompt, config, altModel, 5*time.Minute)
+		if retryErr != nil || len(retryCode) < 50 {
+			emit(fmt.Sprintf("⚠️ %s でのコード修正に失敗: %v", altModel, retryErr))
+			continue
+		}
+
+		retryCode = cleanCodeFences(retryCode)
+		currentCode = retryCode
+		os.WriteFile(scriptPath, []byte(retryCode), 0644)
+
+		retryLines := strings.Count(retryCode, "\n") + 1
+		emit(fmt.Sprintf("✅ 修正版スクリプト生成完了 (%d行)", retryLines))
+		retryPreview := retryCode
+		if lines := strings.SplitN(retryPreview, "\n", 6); len(lines) > 5 {
+			retryPreview = strings.Join(lines[:5], "\n") + "\n..."
+		}
+		emitContent("\n```python\n" + retryPreview + "\n```\n")
+	}
+
+	// Reload ollama models in background
+	emit("🔄 ollamaモデルをバックグラウンドでリロード中...")
+	go reloadOllamaModels(unloadedModels, config)
+
+	// Collect output files
+	emit("📂 出力ファイルを回収中...")
+	result, collectErr := collectDockerOutput(output)
+	if collectErr != nil {
+		emit(fmt.Sprintf("⚠️ 出力回収エラー: %v", collectErr))
+		return result, collectErr
+	}
+	emit("✅ 完了!")
+	return result, nil
+}
+
+// fileExistsInDocker checks if any result file exists in the Docker output directory.
+func fileExistsInDocker(prefix string) bool {
+	out, _ := dockerExec("ls /workspace/output/ 2>/dev/null", 10)
+	return strings.TrimSpace(out) != ""
+}
+
+// truncateStr truncates a string to maxLen characters.
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// cleanCodeFences strips markdown code fences from LLM-generated code.
+func cleanCodeFences(code string) string {
+	code = strings.TrimSpace(code)
+	if strings.HasPrefix(code, "```python") {
+		code = code[len("```python"):]
+	} else if strings.HasPrefix(code, "```") {
+		code = code[3:]
+	}
+	if strings.HasSuffix(code, "```") {
+		code = code[:len(code)-3]
+	}
+	return strings.TrimSpace(code)
+}
+
+// collectDockerOutput copies output files from Docker workspace to playground and returns display text.
+func collectDockerOutput(scriptOutput string) (string, error) {
+	// List output files
+	listing, _ := dockerExec("ls -la /workspace/output/ 2>/dev/null", 10)
+	if strings.TrimSpace(listing) == "" || strings.Contains(listing, "No such file") {
+		// No output files — return script output as text
+		if scriptOutput != "" {
+			return "Script output:\n```\n" + scriptOutput + "\n```", nil
+		}
+		return "", fmt.Errorf("no output produced")
+	}
+
+	// Copy files from Docker workspace to playground
+	home, _ := os.UserHomeDir()
+	srcDir := filepath.Join(home, ".siki", "workspace", "output")
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return "Script output:\n```\n" + scriptOutput + "\n```", nil
+	}
+
+	var results []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		srcPath := filepath.Join(srcDir, entry.Name())
+		dstName := fmt.Sprintf("model_%d_%s", time.Now().UnixMilli(), entry.Name())
+		dstPath := filepath.Join(playgroundDir, dstName)
+
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(dstPath, data, 0644); err != nil {
+			continue
+		}
+
+		urlPath := "/playground/" + dstName
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		switch ext {
+		case ".png", ".jpg", ".jpeg", ".webp", ".gif":
+			results = append(results, fmt.Sprintf("![Generated Image](%s)", urlPath))
+		case ".mp4", ".webm", ".avi", ".mov":
+			results = append(results, fmt.Sprintf("<video src=\"%s\" controls autoplay loop style=\"max-width:100%%\"></video>", urlPath))
+		case ".txt", ".json", ".csv":
+			text := string(data)
+			if len(text) > 5000 {
+				text = text[:5000] + "\n... (truncated)"
+			}
+			results = append(results, fmt.Sprintf("Output (%s):\n```\n%s\n```", entry.Name(), text))
+		default:
+			results = append(results, fmt.Sprintf("[%s](%s)", entry.Name(), urlPath))
+		}
+
+		fmt.Printf("[siki] Output file: %s → %s\n", entry.Name(), urlPath)
+	}
+
+	// Clean up output directory for next run
+	dockerExec("rm -rf /workspace/output/*", 10)
+
+	if len(results) == 0 {
+		return "Script output:\n```\n" + scriptOutput + "\n```", nil
+	}
+
+	result := strings.Join(results, "\n\n")
+	if scriptOutput != "" && len(scriptOutput) < 1000 {
+		result += "\n\nScript log:\n```\n" + scriptOutput + "\n```"
+	}
+	return result, nil
 }
 
 // ============================================================================
@@ -13156,25 +15185,38 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 		if hours == nil {
 			hours = []int{9, 18}
 		}
+		// Return raw values — type="password" fields hide them in the browser
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"email_to":       ws.config.EmailTo,
-			"email_from":     ws.config.EmailFrom,
-			"smtp_host":      ws.config.SMTPHost,
-			"smtp_port":      ws.config.SMTPPort,
-			"smtp_user":      ws.config.SMTPUser,
-			"digest_enabled": ws.config.DigestEnabled,
-			"digest_hours":   hours,
+			"email_to":                ws.config.EmailTo,
+			"email_from":              ws.config.EmailFrom,
+			"smtp_host":               ws.config.SMTPHost,
+			"smtp_port":               ws.config.SMTPPort,
+			"smtp_user":               ws.config.SMTPUser,
+			"digest_enabled":          ws.config.DigestEnabled,
+			"digest_hours":            hours,
+			"twitter_enabled":         ws.config.TwitterEnabled,
+			"twitter_bearer_token":    ws.config.TwitterBearerToken,
+			"twitter_consumer_key":    ws.config.TwitterConsumerKey,
+			"twitter_consumer_secret": ws.config.TwitterConsumerSecret,
+			"twitter_access_token":    ws.config.TwitterAccessToken,
+			"twitter_access_secret":   ws.config.TwitterAccessSecret,
 		})
 	case http.MethodPost:
 		var req struct {
-			EmailTo       string `json:"email_to"`
-			EmailFrom     string `json:"email_from"`
-			SMTPHost      string `json:"smtp_host"`
-			SMTPPort      int    `json:"smtp_port"`
-			SMTPUser      string `json:"smtp_user"`
-			SMTPPass      string `json:"smtp_pass"`
-			DigestEnabled bool   `json:"digest_enabled"`
-			DigestHours   []int  `json:"digest_hours"`
+			EmailTo               string `json:"email_to"`
+			EmailFrom             string `json:"email_from"`
+			SMTPHost              string `json:"smtp_host"`
+			SMTPPort              int    `json:"smtp_port"`
+			SMTPUser              string `json:"smtp_user"`
+			SMTPPass              string `json:"smtp_pass"`
+			DigestEnabled         bool   `json:"digest_enabled"`
+			DigestHours           []int  `json:"digest_hours"`
+			TwitterEnabled        bool   `json:"twitter_enabled"`
+			TwitterBearerToken    string `json:"twitter_bearer_token"`
+			TwitterConsumerKey    string `json:"twitter_consumer_key"`
+			TwitterConsumerSecret string `json:"twitter_consumer_secret"`
+			TwitterAccessToken    string `json:"twitter_access_token"`
+			TwitterAccessSecret   string `json:"twitter_access_secret"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -13195,16 +15237,29 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 		if len(req.DigestHours) > 0 {
 			ws.config.DigestHours = req.DigestHours
 		}
+		ws.config.TwitterEnabled = req.TwitterEnabled
+		ws.config.TwitterBearerToken = req.TwitterBearerToken
+		ws.config.TwitterConsumerKey = req.TwitterConsumerKey
+		ws.config.TwitterConsumerSecret = req.TwitterConsumerSecret
+		ws.config.TwitterAccessToken = req.TwitterAccessToken
+		ws.config.TwitterAccessSecret = req.TwitterAccessSecret
+		cachedTwitterUserID = ""
 		// Persist to file
 		dc := &DigestConfig{
-			EmailTo:       ws.config.EmailTo,
-			EmailFrom:     ws.config.EmailFrom,
-			SMTPHost:      ws.config.SMTPHost,
-			SMTPPort:      ws.config.SMTPPort,
-			SMTPUser:      ws.config.SMTPUser,
-			SMTPPass:      ws.config.SMTPPass,
-			DigestEnabled: ws.config.DigestEnabled,
-			DigestHours:   ws.config.DigestHours,
+			EmailTo:               ws.config.EmailTo,
+			EmailFrom:             ws.config.EmailFrom,
+			SMTPHost:              ws.config.SMTPHost,
+			SMTPPort:              ws.config.SMTPPort,
+			SMTPUser:              ws.config.SMTPUser,
+			SMTPPass:              ws.config.SMTPPass,
+			DigestEnabled:         ws.config.DigestEnabled,
+			DigestHours:           ws.config.DigestHours,
+			TwitterBearerToken:    ws.config.TwitterBearerToken,
+			TwitterEnabled:        ws.config.TwitterEnabled,
+			TwitterConsumerKey:    ws.config.TwitterConsumerKey,
+			TwitterConsumerSecret: ws.config.TwitterConsumerSecret,
+			TwitterAccessToken:    ws.config.TwitterAccessToken,
+			TwitterAccessSecret:   ws.config.TwitterAccessSecret,
 		}
 		ws.mu.Unlock()
 		if err := saveDigestConfig(dc); err != nil {
@@ -13242,7 +15297,7 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 		// /api/threads
 		switch r.Method {
 		case http.MethodGet:
-			// List all threads
+			// List threads with optional type filter: ?type=user|autonomous|all (default: all)
 			items, err := listThreads()
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -13250,6 +15305,30 @@ func (ws *WebServer) handleThreads(w http.ResponseWriter, r *http.Request) {
 			}
 			if items == nil {
 				items = []ThreadListItem{}
+			}
+			typeFilter := r.URL.Query().Get("type")
+			if typeFilter == "user" {
+				var filtered []ThreadListItem
+				for _, t := range items {
+					if !strings.HasPrefix(t.ID, idleThreadIDPrefix) && !strings.HasPrefix(t.ID, proactiveThreadIDPrefix) {
+						filtered = append(filtered, t)
+					}
+				}
+				if filtered == nil {
+					filtered = []ThreadListItem{}
+				}
+				items = filtered
+			} else if typeFilter == "autonomous" {
+				var filtered []ThreadListItem
+				for _, t := range items {
+					if strings.HasPrefix(t.ID, idleThreadIDPrefix) || strings.HasPrefix(t.ID, proactiveThreadIDPrefix) {
+						filtered = append(filtered, t)
+					}
+				}
+				if filtered == nil {
+					filtered = []ThreadListItem{}
+				}
+				items = filtered
 			}
 			json.NewEncoder(w).Encode(items)
 		case http.MethodPost:
