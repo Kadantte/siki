@@ -1645,6 +1645,16 @@
                         </div>
                     </div>
                 </details>
+
+                <h4 style="margin: 0.8rem 0 0.3rem; font-size: 0.9rem;">Bluesky</h4>
+                <div style="display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem;">
+                    <label style="font-size: 0.85rem; display: flex; align-items: center; gap: 0.3rem; cursor: pointer;">
+                        <input type="checkbox" id="setting-bluesky-enabled"> Enable Bluesky AI/ML Feed
+                    </label>
+                </div>
+                <div style="font-size: 0.72rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
+                    AI/MLスターターパックからの投稿を定期取得します（認証不要）
+                </div>
             </div>
 
             <div class="modal-actions">
@@ -3322,6 +3332,7 @@
                 for (const [elemId, key] of oauthFields) {
                     document.getElementById(elemId).value = digestData[key] || '';
                 }
+                document.getElementById('setting-bluesky-enabled').checked = digestData.bluesky_enabled || false;
             } catch (e) {
                 console.error('Failed to load digest settings:', e);
             }
@@ -3428,7 +3439,8 @@
                         twitter_consumer_key: document.getElementById('setting-twitter-consumer-key').value || '',
                         twitter_consumer_secret: document.getElementById('setting-twitter-consumer-secret').value || '',
                         twitter_access_token: document.getElementById('setting-twitter-access-token').value || '',
-                        twitter_access_secret: document.getElementById('setting-twitter-access-secret').value || ''
+                        twitter_access_secret: document.getElementById('setting-twitter-access-secret').value || '',
+                        bluesky_enabled: document.getElementById('setting-bluesky-enabled').checked
                     })
                 });
 

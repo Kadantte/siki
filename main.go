@@ -101,6 +101,9 @@ type Config struct {
 	TwitterConsumerSecret string `json:"twitter_consumer_secret"`
 	TwitterAccessToken    string `json:"twitter_access_token"`
 	TwitterAccessSecret   string `json:"twitter_access_secret"`
+	// Bluesky feed integration
+	BlueskyEnabled      bool     `json:"bluesky_enabled"`
+	BlueskyStarterPacks []string `json:"bluesky_starter_packs"`
 }
 
 // primaryProvider returns the first provider, or builds one from legacy config fields
@@ -468,6 +471,14 @@ var tools = []Tool{
 	{
 		Name:        "twitter_timeline",
 		Description: "Fetch the authenticated user's Twitter/X home timeline and summarize it. Use this when the user asks to see their timeline, what's happening on their feed, or wants a summary of recent tweets from people they follow.",
+		Parameters: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	},
+	{
+		Name:        "bluesky_feed",
+		Description: "Bluesky AI/MLコミュニティの投稿を取得・表示する。ユーザーがBlueskyフィードの確認、AI/MLコミュニティの話題を知りたい場合に使用。",
 		Parameters: map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
@@ -1492,6 +1503,68 @@ func (a *Agent) executeTool(name string, args map[string]interface{}) (result st
 			maxResults = int(n)
 		}
 		return twitterSearch(query, maxResults, a.config)
+	case "bluesky_feed":
+		if !a.config.BlueskyEnabled {
+			return "", fmt.Errorf("Blueskyフィードが有効化されていません。設定画面からBlueskyを有効にしてください")
+		}
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: "Blueskyフィードを取得中..."})
+		}
+		// Load cached feed (if within 30 min, reuse; otherwise re-fetch)
+		feed := loadBlueskyFeed()
+		if time.Since(feed.LastFetched) > 30*time.Minute || len(feed.Posts) == 0 {
+			if a.sendEvent != nil {
+				a.sendEvent(StreamEvent{Type: "progress", Content: "ハンドル一覧を解決中..."})
+			}
+			handles, err := resolveBlueskyHandles(a.config)
+			if err != nil || len(handles) == 0 {
+				return "", fmt.Errorf("Blueskyハンドル取得失敗: %v", err)
+			}
+			if a.sendEvent != nil {
+				a.sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("%dアカウントから投稿取得中...", len(handles))})
+			}
+			newPosts := fetchAllBlueskyPosts(handles)
+			feed.Posts = mergeBlueskyPosts(feed.Posts, newPosts)
+			feed.LastFetched = time.Now()
+			saveBlueskyFeed(feed)
+		}
+		recentPosts := filterRecentBlueskyPosts(feed.Posts, 24*time.Hour)
+		if len(recentPosts) == 0 {
+			return "Blueskyフィードに最近の投稿がありません。", nil
+		}
+		// Show raw feed immediately
+		rawFeed := formatBlueskyPosts(recentPosts, fmt.Sprintf("Bluesky AI/MLフィード（%d件）", len(recentPosts)))
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "tool_call", Name: "bluesky_feed", Result: rawFeed})
+		}
+		// Extract intent
+		userIntent, _ := args["intent"].(string)
+		if userIntent == "" {
+			userIntent = a.lastUserMessage()
+		}
+		intentPrompt := fmt.Sprintf(`Extract the search topic from this message. Remove action/instruction words (bluesky, ブルースカイ, フィード, まとめて, etc). Output ONLY the topic, nothing else.
+Message: %s
+Topic:`, userIntent)
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: "テーマ抽出中..."})
+		}
+		extractedIntent, err := callFastModel(intentPrompt, a.config)
+		if err == nil && strings.TrimSpace(extractedIntent) != "" {
+			extractedIntent = strings.TrimSpace(extractedIntent)
+			extractedIntent = strings.Trim(extractedIntent, "「」\"'")
+			if extractedIntent != "" {
+				fmt.Printf("[siki] Bluesky extracted intent: %q -> %q\n", userIntent, extractedIntent)
+				userIntent = extractedIntent
+			}
+		}
+		if a.sendEvent != nil {
+			a.sendEvent(StreamEvent{Type: "progress", Content: fmt.Sprintf("テーマ: %s", userIntent)})
+		}
+		filtered := filterBlueskyByIntent(recentPosts, userIntent, a.config, a.sendEvent)
+		if len(filtered) == 0 {
+			return fmt.Sprintf("\n\n---\nAI選別結果: %d件中、「%s」に該当する投稿はありませんでした。", len(recentPosts), userIntent), nil
+		}
+		return formatBlueskyPosts(filtered, fmt.Sprintf("\n\n---\n## AI選別結果: %d件中%d件を抽出", len(recentPosts), len(filtered))), nil
 	case "twitter_timeline":
 		if !hasTwitterOAuth1a(a.config) {
 			return "", fmt.Errorf("Twitter OAuth 1.0a が設定されていません。設定画面からConsumer Key/Secret, Access Token/Secretを設定してください")
@@ -5177,6 +5250,7 @@ func detectToolFromKeywords(userMsg string) string {
 		{[]string{"動画生成", "動画を生成", "動画を作", "ビデオ生成", "ビデオを作", "映像生成", "映像を作", "video generat", "generate video", "アニメーション生成"}, "generate_video"},
 		{[]string{"画像生成", "イラスト描", "インフォグラフィック", "image generat", "generate image", "画像を生成", "画像を作"}, "generate_image"},
 		{[]string{"過去の会話", "会話ログ", "過去ログ", "前の会話", "さっきの会話", "会話履歴", "スレッド検索", "やり取り"}, "search_threads"},
+		{[]string{"bluesky", "bsky", "ブルースカイ"}, "bluesky_feed"},
 		{[]string{"タイムライン", "timeline", "フィード", "feed"}, "twitter_timeline"},
 		{[]string{"twitter", "ツイッター", "ツイート", "tweet", "x.com"}, "twitter_search"},
 		{[]string{"ニュース", "news", "最新", "速報", "トレンド"}, "web_search"},
@@ -5775,6 +5849,76 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		// Fall through to normal pipeline if escalation didn't work
 	}
 
+	// Fast-path: skip orchestrator for Bluesky requests
+	if containsBlueskyKeywords(userMsg) && ws.config.BlueskyEnabled {
+		fmt.Printf("[siki] Fast-path: bluesky_feed (skipping orchestrator)\n")
+		agent.sendEvent = sendEvent
+		args := map[string]interface{}{}
+
+		sendEvent(StreamEvent{Type: "tool_start", Name: "bluesky_feed"})
+		result, err := agent.executeTool("bluesky_feed", args)
+		if err != nil {
+			sendEvent(StreamEvent{Type: "error", Error: fmt.Sprintf("Bluesky error: %v", err)})
+			return ""
+		}
+		sendEvent(StreamEvent{Type: "tool_call", Name: "bluesky_feed", Result: result})
+
+		toolCallID := fmt.Sprintf("fast-%d", time.Now().UnixMilli())
+		argsJSON, _ := json.Marshal(args)
+		assistantMsg := Message{Role: "assistant", ToolCalls: []ToolCall{{ID: toolCallID, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: "bluesky_feed", Arguments: string(argsJSON)}}}}
+		agent.messages = append(agent.messages, assistantMsg)
+		saveMsg(assistantMsg, "")
+		toolMsg := Message{Role: "tool", Content: result, ToolCallID: toolCallID}
+		agent.messages = append(agent.messages, toolMsg)
+		saveMsg(toolMsg, "bluesky_feed")
+
+		// Generate summary with gpt-oss
+		summaryInput := result
+		if len([]rune(summaryInput)) > 6000 {
+			summaryInput = string([]rune(summaryInput)[:6000]) + "\n...(省略)"
+		}
+		summaryPrompt := fmt.Sprintf(`あなたはニュースキュレーターです。以下はBluesky AI/MLコミュニティからAIが選別した投稿です。ユーザーの要求「%s」に基づき、重要なニュースや話題をわかりやすくまとめてください。
+- 重要度の高い順に整理
+- 各トピックの要点を簡潔に
+- 注目すべきリンクがあれば言及
+- 日本語で回答
+
+選別結果:
+%s`, userMsg, summaryInput)
+
+		sendEvent(StreamEvent{Type: "progress", Content: "gpt-ossでまとめを生成中..."})
+		summary, err := streamVLLMGenerate(
+			ws.config.ModelName,
+			summaryPrompt,
+			2048,
+			120*time.Second,
+			ws.config.APIEndpoint,
+			sendEvent,
+		)
+		if err != nil {
+			fmt.Printf("[siki] vllm summary failed: %v, trying ollama gpt-oss...\n", err)
+			summary, err = streamOllamaGenerate("gpt-oss:latest", summaryPrompt, 2048, 120*time.Second, sendEvent)
+			if err != nil {
+				fmt.Printf("[siki] ollama summary also failed: %v, using raw result\n", err)
+				summary = result
+			}
+		}
+
+		finalMsg := Message{Role: "assistant", Content: summary}
+		agent.messages = append(agent.messages, finalMsg)
+		saveMsg(finalMsg, "")
+		sendEvent(StreamEvent{Type: "done"})
+		if cID != "" {
+			ws.mu.Lock()
+			ws.lastExec[cID] = &LastToolExecution{UserMsg: userMsg, ToolName: "bluesky_feed", Args: args, ToolResult: result, Response: summary, UsedAgent: false}
+			ws.mu.Unlock()
+		}
+		return summary
+	}
+
 	// Fast-path: skip orchestrator entirely for Twitter requests (keyword match is definitive)
 	if containsTwitterKeywords(userMsg) {
 		twitterTool := detectTwitterTool(userMsg)
@@ -6002,6 +6146,13 @@ func (ws *WebServer) dualModelPipeline(ctx context.Context, agent *Agent, userMs
 		twitterTool := detectTwitterTool(userMsg)
 		fmt.Printf("[siki] Forcing %s: Twitter keyword detected (was: %s)\n", twitterTool, decision.Tool)
 		decision.Tool = twitterTool
+		decision.Args = nil
+	}
+
+	// Force bluesky_feed when Bluesky keywords detected
+	if decision.Tool != "bluesky_feed" && containsBlueskyKeywords(userMsg) {
+		fmt.Printf("[siki] Forcing bluesky_feed: Bluesky keyword detected (was: %s)\n", decision.Tool)
+		decision.Tool = "bluesky_feed"
 		decision.Args = nil
 	}
 
@@ -8491,6 +8642,9 @@ type DigestConfig struct {
 	TwitterConsumerSecret string `json:"twitter_consumer_secret"`
 	TwitterAccessToken    string `json:"twitter_access_token"`
 	TwitterAccessSecret   string `json:"twitter_access_secret"`
+	// Bluesky
+	BlueskyEnabled      bool     `json:"bluesky_enabled"`
+	BlueskyStarterPacks []string `json:"bluesky_starter_packs"`
 }
 
 // digestConfigDir can be overridden in tests to avoid writing to the real ~/.siki/
@@ -8546,6 +8700,8 @@ func applyDigestConfig(config *Config) {
 	config.TwitterConsumerSecret = dc.TwitterConsumerSecret
 	config.TwitterAccessToken = dc.TwitterAccessToken
 	config.TwitterAccessSecret = dc.TwitterAccessSecret
+	config.BlueskyEnabled = dc.BlueskyEnabled
+	config.BlueskyStarterPacks = dc.BlueskyStarterPacks
 }
 
 func (ws *WebServer) digestLoop() {
@@ -8698,6 +8854,29 @@ JSON配列のみ出力: ["クエリ1","クエリ2","クエリ3"]`, dateStr, date
 		}
 	}
 
+	// 4.6 Bluesky AI/MLフィード
+	if ws.config.BlueskyEnabled {
+		feed := loadBlueskyFeed()
+		recentPosts := filterRecentBlueskyPosts(feed.Posts, 12*time.Hour)
+		if len(recentPosts) > 0 {
+			fmt.Printf("[siki] Digest: processing %d Bluesky posts...\n", len(recentPosts))
+			bskyHTML := filterAndSummarizeBluesky(recentPosts, ws.config)
+			if bskyHTML != "" {
+				freshResults += "\n\n## Bluesky AI/MLフィード:\n" + bskyHTML
+				fmt.Printf("[siki] Digest: Bluesky section added (%d bytes)\n", len(bskyHTML))
+			}
+
+			// Deep-dive high-engagement posts
+			deepDive := blueskyDeepDivePosts(recentPosts, ws.config)
+			if deepDive != "" {
+				freshResults += "\n\n## Bluesky注目記事の要約:\n" + deepDive
+				fmt.Printf("[siki] Digest: Bluesky deep-dive added (%d bytes)\n", len(deepDive))
+			}
+		} else {
+			fmt.Println("[siki] Digest: no recent Bluesky posts (last 12h)")
+		}
+	}
+
 	// 5. Summarize with LLM
 	fmt.Println("[siki] Digest: summarizing results...")
 	summaryPrompt := fmt.Sprintf(`今日は%s%d日です。以下の検索結果をもとに、ユーザーにとって有益な最新情報を選んでダイジェストにまとめよ。
@@ -8798,6 +8977,660 @@ type TwitterTweet struct {
 	ReplyCount      int    // from public_metrics
 	RetweetCount    int    // from public_metrics
 	LikeCount       int    // from public_metrics
+}
+
+// --- Bluesky types ---
+
+type BlueskyPost struct {
+	URI           string    `json:"uri"`
+	CID           string    `json:"cid"`
+	Text          string    `json:"text"`
+	CreatedAt     string    `json:"created_at"`
+	AuthorHandle  string    `json:"author_handle"`
+	AuthorName    string    `json:"author_name"`
+	AvatarURL     string    `json:"avatar_url"`
+	ReplyCount    int       `json:"reply_count"`
+	RepostCount   int       `json:"repost_count"`
+	LikeCount     int       `json:"like_count"`
+	QuoteCount    int       `json:"quote_count"`
+	ExternalURL   string    `json:"external_url,omitempty"`
+	ExternalTitle string    `json:"external_title,omitempty"`
+	ImageURLs     []string  `json:"image_urls,omitempty"`
+	FetchedAt     time.Time `json:"fetched_at"`
+}
+
+func (p BlueskyPost) EngagementScore() int {
+	return p.LikeCount + p.RepostCount*3 + p.ReplyCount*2 + p.QuoteCount*2
+}
+
+type BlueskyFeed struct {
+	Handles        []string      `json:"handles"`
+	HandlesFetched time.Time     `json:"handles_fetched"`
+	Posts          []BlueskyPost `json:"posts"`
+	LastFetched    time.Time     `json:"last_fetched"`
+}
+
+// Default AI/ML starter packs from blueskystarterpack.com/aiml
+var defaultBlueskyAIStarterPacks = []string{
+	"at://did:plc:bmkptaqvfcwmgom75fmo5oo6/app.bsky.graph.starterpack/3laeesmwbi62l", // Engineers, Developers & Tech People
+	"at://did:plc:oqqpxzlqy7m7z2zqps3rjrts/app.bsky.graph.starterpack/3m2mrpgmdql2d", // Plant modelling scientists II
+	"at://did:plc:oqqpxzlqy7m7z2zqps3rjrts/app.bsky.graph.starterpack/3lbdjhpwhwa23", // Plant modelling scientists I
+	"at://did:plc:z3lil7hj3jloch4r3owljui5/app.bsky.graph.starterpack/3lcpvfls27723", // MLSupple
+	"at://did:plc:q7tjqlj55q5j54aoipdc6r7i/app.bsky.graph.starterpack/3lawbuqz4yv27", // Paul van der Meer
+	"at://did:plc:5ldqhnk4quyil4mie2yjg2po/app.bsky.graph.starterpack/3llhdncyla32y", // HABSFRANK STARTER PACK 5
+	"at://did:plc:mptsx33lhqsobeooj5k23cqh/app.bsky.graph.starterpack/3lnsym7j76w2f", // Tom Wittig's Tech Stack
+	"at://did:plc:vtpyqvwce4x6gpa5dcizqecy/app.bsky.graph.starterpack/3lbuyxxgv432y", // TechCrunch
+	"at://did:plc:al62dnktcv4nwprgml2ryfnz/app.bsky.graph.starterpack/3lbhmp4cwl72w", // Red Hat
+	"at://did:plc:7xmdqtvxy43625hisyy4wksb/app.bsky.graph.starterpack/3lgxxttp4u722", // Canadian AI Researchers
+}
+
+// --- Bluesky API functions (public, no auth required) ---
+
+const blueskyPublicAPI = "https://public.api.bsky.app/xrpc/"
+
+// blueskyAPIGet performs a GET request to the Bluesky public API.
+func blueskyAPIGet(endpoint string) ([]byte, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", blueskyPublicAPI+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("bluesky API %s: status %d: %s", endpoint, resp.StatusCode, string(body[:min(len(body), 200)]))
+	}
+	return body, nil
+}
+
+// fetchBlueskyStarterPackMembers fetches all member handles from a starter pack.
+func fetchBlueskyStarterPackMembers(starterPackURI string) ([]string, error) {
+	// Step 1: Get starter pack details to find the list URI
+	data, err := blueskyAPIGet("app.bsky.graph.getStarterPack?starterPack=" + url.QueryEscape(starterPackURI))
+	if err != nil {
+		return nil, fmt.Errorf("getStarterPack failed: %w", err)
+	}
+
+	var spResp struct {
+		StarterPack struct {
+			List struct {
+				URI string `json:"uri"`
+			} `json:"list"`
+		} `json:"starterPack"`
+	}
+	if err := json.Unmarshal(data, &spResp); err != nil {
+		return nil, fmt.Errorf("parse starterPack response: %w", err)
+	}
+	listURI := spResp.StarterPack.List.URI
+	if listURI == "" {
+		return nil, fmt.Errorf("no list URI in starter pack %s", starterPackURI)
+	}
+
+	// Step 2: Get all members from the list (with pagination)
+	var handles []string
+	cursor := ""
+	for {
+		ep := "app.bsky.graph.getList?list=" + url.QueryEscape(listURI) + "&limit=100"
+		if cursor != "" {
+			ep += "&cursor=" + url.QueryEscape(cursor)
+		}
+		data, err := blueskyAPIGet(ep)
+		if err != nil {
+			return handles, fmt.Errorf("getList failed: %w", err)
+		}
+		var listResp struct {
+			Items []struct {
+				Subject struct {
+					Handle string `json:"handle"`
+				} `json:"subject"`
+			} `json:"items"`
+			Cursor string `json:"cursor"`
+		}
+		if err := json.Unmarshal(data, &listResp); err != nil {
+			return handles, fmt.Errorf("parse getList: %w", err)
+		}
+		for _, item := range listResp.Items {
+			if item.Subject.Handle != "" {
+				handles = append(handles, item.Subject.Handle)
+			}
+		}
+		if listResp.Cursor == "" || len(listResp.Items) == 0 {
+			break
+		}
+		cursor = listResp.Cursor
+	}
+	return handles, nil
+}
+
+// blueskyFeedPath returns the path to the Bluesky feed cache file.
+func blueskyFeedPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".siki", "bluesky_feed.json")
+}
+
+// loadBlueskyFeed loads the cached Bluesky feed from disk.
+func loadBlueskyFeed() *BlueskyFeed {
+	data, err := os.ReadFile(blueskyFeedPath())
+	if err != nil {
+		return &BlueskyFeed{}
+	}
+	var feed BlueskyFeed
+	if err := json.Unmarshal(data, &feed); err != nil {
+		return &BlueskyFeed{}
+	}
+	return &feed
+}
+
+// saveBlueskyFeed saves the Bluesky feed to disk.
+func saveBlueskyFeed(feed *BlueskyFeed) error {
+	data, err := json.MarshalIndent(feed, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(blueskyFeedPath())
+	os.MkdirAll(dir, 0755)
+	return os.WriteFile(blueskyFeedPath(), data, 0644)
+}
+
+// mergeBlueskyPosts merges new posts into existing, deduplicating by URI, updating metrics, pruning old.
+func mergeBlueskyPosts(existing, newPosts []BlueskyPost) []BlueskyPost {
+	byURI := make(map[string]BlueskyPost)
+	for _, p := range existing {
+		byURI[p.URI] = p
+	}
+	for _, p := range newPosts {
+		byURI[p.URI] = p // newer metrics overwrite
+	}
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	var result []BlueskyPost
+	for _, p := range byURI {
+		t, _ := time.Parse(time.RFC3339, p.CreatedAt)
+		if !t.IsZero() && t.Before(cutoff) {
+			continue
+		}
+		result = append(result, p)
+	}
+	// Sort by created_at descending
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].CreatedAt > result[j].CreatedAt
+	})
+	if len(result) > 2000 {
+		result = result[:2000]
+	}
+	return result
+}
+
+// resolveBlueskyHandles gets all unique handles from starter packs, with 24h cache.
+func resolveBlueskyHandles(config *Config) ([]string, error) {
+	feed := loadBlueskyFeed()
+	if len(feed.Handles) > 0 && time.Since(feed.HandlesFetched) < 24*time.Hour {
+		return feed.Handles, nil
+	}
+
+	packs := config.BlueskyStarterPacks
+	if len(packs) == 0 {
+		packs = defaultBlueskyAIStarterPacks
+	}
+
+	seen := make(map[string]bool)
+	var allHandles []string
+	for _, packURI := range packs {
+		handles, err := fetchBlueskyStarterPackMembers(packURI)
+		if err != nil {
+			fmt.Printf("[siki] Bluesky: starter pack %s failed: %v\n", packURI, err)
+			continue
+		}
+		for _, h := range handles {
+			if !seen[h] {
+				seen[h] = true
+				allHandles = append(allHandles, h)
+			}
+		}
+		time.Sleep(200 * time.Millisecond) // rate limit courtesy
+	}
+
+	if len(allHandles) > 0 {
+		feed.Handles = allHandles
+		feed.HandlesFetched = time.Now()
+		saveBlueskyFeed(feed)
+		fmt.Printf("[siki] Bluesky: resolved %d unique handles from %d starter packs\n", len(allHandles), len(packs))
+	}
+	return allHandles, nil
+}
+
+// fetchBlueskyAuthorFeed fetches recent posts from a single Bluesky user.
+func fetchBlueskyAuthorFeed(handle string, limit int) ([]BlueskyPost, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	ep := fmt.Sprintf("app.bsky.feed.getAuthorFeed?actor=%s&limit=%d&filter=posts_no_replies", url.QueryEscape(handle), limit)
+	data, err := blueskyAPIGet(ep)
+	if err != nil {
+		return nil, err
+	}
+
+	var feedResp struct {
+		Feed []struct {
+			Post struct {
+				URI    string `json:"uri"`
+				CID    string `json:"cid"`
+				Author struct {
+					Handle    string `json:"handle"`
+					DisplayName string `json:"displayName"`
+					Avatar    string `json:"avatar"`
+				} `json:"author"`
+				Record json.RawMessage `json:"record"`
+				ReplyCount  int `json:"replyCount"`
+				RepostCount int `json:"repostCount"`
+				LikeCount   int `json:"likeCount"`
+				QuoteCount  int `json:"quoteCount"`
+				Embed json.RawMessage `json:"embed"`
+			} `json:"post"`
+		} `json:"feed"`
+	}
+	if err := json.Unmarshal(data, &feedResp); err != nil {
+		return nil, fmt.Errorf("parse author feed: %w", err)
+	}
+
+	var posts []BlueskyPost
+	for _, item := range feedResp.Feed {
+		p := BlueskyPost{
+			URI:          item.Post.URI,
+			CID:          item.Post.CID,
+			AuthorHandle: item.Post.Author.Handle,
+			AuthorName:   item.Post.Author.DisplayName,
+			AvatarURL:    item.Post.Author.Avatar,
+			ReplyCount:   item.Post.ReplyCount,
+			RepostCount:  item.Post.RepostCount,
+			LikeCount:    item.Post.LikeCount,
+			QuoteCount:   item.Post.QuoteCount,
+			FetchedAt:    time.Now(),
+		}
+
+		// Parse record for text and createdAt
+		var record struct {
+			Text      string `json:"text"`
+			CreatedAt string `json:"createdAt"`
+			Embed     *struct {
+				Type     string `json:"$type"`
+				External *struct {
+					URI   string `json:"uri"`
+					Title string `json:"title"`
+				} `json:"external"`
+			} `json:"embed"`
+		}
+		if err := json.Unmarshal(item.Post.Record, &record); err == nil {
+			p.Text = record.Text
+			p.CreatedAt = record.CreatedAt
+			if record.Embed != nil && record.Embed.External != nil {
+				p.ExternalURL = record.Embed.External.URI
+				p.ExternalTitle = record.Embed.External.Title
+			}
+		}
+
+		// Parse embed for images and external links at post level
+		if len(item.Post.Embed) > 0 {
+			var embed struct {
+				Type     string `json:"$type"`
+				Images   []struct {
+					Fullsize string `json:"fullsize"`
+					Thumb    string `json:"thumb"`
+				} `json:"images"`
+				External *struct {
+					URI   string `json:"uri"`
+					Title string `json:"title"`
+				} `json:"external"`
+			}
+			if err := json.Unmarshal(item.Post.Embed, &embed); err == nil {
+				for _, img := range embed.Images {
+					if img.Fullsize != "" {
+						p.ImageURLs = append(p.ImageURLs, img.Fullsize)
+					} else if img.Thumb != "" {
+						p.ImageURLs = append(p.ImageURLs, img.Thumb)
+					}
+				}
+				if p.ExternalURL == "" && embed.External != nil {
+					p.ExternalURL = embed.External.URI
+					p.ExternalTitle = embed.External.Title
+				}
+			}
+		}
+
+		posts = append(posts, p)
+	}
+	return posts, nil
+}
+
+// fetchAllBlueskyPosts fetches posts from all handles concurrently (max 5 goroutines).
+func fetchAllBlueskyPosts(handles []string) []BlueskyPost {
+	type result struct {
+		posts []BlueskyPost
+		err   error
+	}
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	ch := make(chan result, len(handles))
+	sem := make(chan struct{}, 5) // concurrency limit
+
+	for _, handle := range handles {
+		sem <- struct{}{}
+		go func(h string) {
+			defer func() { <-sem }()
+			time.Sleep(200 * time.Millisecond) // rate limit courtesy
+			posts, err := fetchBlueskyAuthorFeed(h, 50)
+			ch <- result{posts, err}
+		}(handle)
+	}
+
+	var allPosts []BlueskyPost
+	seen := make(map[string]bool)
+	for range handles {
+		r := <-ch
+		if r.err != nil {
+			continue
+		}
+		for _, p := range r.posts {
+			t, _ := time.Parse(time.RFC3339, p.CreatedAt)
+			if !t.IsZero() && t.Before(cutoff) {
+				continue
+			}
+			if !seen[p.URI] {
+				seen[p.URI] = true
+				allPosts = append(allPosts, p)
+			}
+		}
+	}
+
+	// Sort by created_at descending
+	sort.Slice(allPosts, func(i, j int) bool {
+		return allPosts[i].CreatedAt > allPosts[j].CreatedAt
+	})
+	return allPosts
+}
+
+// filterRecentBlueskyPosts filters posts within the given duration.
+func filterRecentBlueskyPosts(posts []BlueskyPost, dur time.Duration) []BlueskyPost {
+	cutoff := time.Now().Add(-dur)
+	var result []BlueskyPost
+	for _, p := range posts {
+		t, _ := time.Parse(time.RFC3339, p.CreatedAt)
+		if !t.IsZero() && t.After(cutoff) {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// formatBlueskyPosts renders Bluesky posts as markdown (similar to formatOneTweet).
+func formatBlueskyPosts(posts []BlueskyPost, title string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s\n\n", title))
+	for i, p := range posts {
+		sb.WriteString(fmt.Sprintf("### %d. ", i+1))
+		if p.AvatarURL != "" {
+			sb.WriteString(fmt.Sprintf("<img src=\"%s\" width=\"32\" height=\"32\" style=\"border-radius:50%%;vertical-align:middle;margin-right:6px\"> ", p.AvatarURL))
+		}
+		name := p.AuthorName
+		if name == "" {
+			name = p.AuthorHandle
+		}
+		sb.WriteString(fmt.Sprintf("**%s** (@%s)\n%s\n", name, p.AuthorHandle, p.Text))
+		for _, imgURL := range p.ImageURLs {
+			sb.WriteString(fmt.Sprintf("\n![image](%s)\n", imgURL))
+		}
+		if p.ExternalURL != "" {
+			title := p.ExternalTitle
+			if title == "" {
+				title = p.ExternalURL
+			}
+			sb.WriteString(fmt.Sprintf("\n🔗 [%s](%s)\n", title, p.ExternalURL))
+		}
+		if p.ReplyCount > 0 || p.LikeCount > 0 || p.RepostCount > 0 {
+			sb.WriteString(fmt.Sprintf("\n💬%d 🔁%d ❤%d", p.ReplyCount, p.RepostCount, p.LikeCount))
+			if p.QuoteCount > 0 {
+				sb.WriteString(fmt.Sprintf(" 💭%d", p.QuoteCount))
+			}
+		}
+		if p.CreatedAt != "" {
+			sb.WriteString(fmt.Sprintf("\n*%s*", p.CreatedAt))
+		}
+		sb.WriteString(fmt.Sprintf(" [↗](https://bsky.app/profile/%s)\n\n---\n\n", p.AuthorHandle))
+	}
+	return sb.String()
+}
+
+// filterAndSummarizeBluesky summarizes Bluesky posts using LLM (like filterAndSummarizeTwitter).
+func filterAndSummarizeBluesky(posts []BlueskyPost, config *Config) string {
+	if len(posts) == 0 {
+		return ""
+	}
+	// Sort by engagement and take top 30
+	sorted := make([]BlueskyPost, len(posts))
+	copy(sorted, posts)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].EngagementScore() > sorted[j].EngagementScore()
+	})
+	if len(sorted) > 30 {
+		sorted = sorted[:30]
+	}
+
+	var sb strings.Builder
+	for _, p := range sorted {
+		name := p.AuthorName
+		if name == "" {
+			name = p.AuthorHandle
+		}
+		sb.WriteString(fmt.Sprintf("[%s] %s (@%s): %s", p.CreatedAt, name, p.AuthorHandle, p.Text))
+		if p.ExternalURL != "" {
+			sb.WriteString(fmt.Sprintf(" URL: %s", p.ExternalURL))
+		}
+		sb.WriteString(fmt.Sprintf(" (❤%d 🔁%d 💬%d)\n\n", p.LikeCount, p.RepostCount, p.ReplyCount))
+	}
+
+	prompt := fmt.Sprintf(`以下はBluesky AI/MLコミュニティの%d件の投稿です。
+AI・機械学習・LLM・大規模言語モデル・テクノロジー・プログラミングに関連する投稿のみ抽出し、重要度順にまとめてください。
+
+## 投稿:
+%s
+
+## ルール:
+- AI/ML/LLM/テクノロジーに関連するもののみ抽出
+- 各項目に元の投稿著者名を含めること
+- 投稿に含まれるURLはそのまま<a href>で残すこと
+- HTML形式（<h3>, <p>, <a>タグ使用）で出力
+- 関連投稿が1件もない場合は「該当なし」とだけ出力
+- 日本語で出力すること`, len(sorted), truncateStr(sb.String(), 8000))
+
+	_, result, err := callSubModel(prompt, config)
+	if err != nil {
+		fmt.Printf("[siki] Bluesky summary LLM failed: %v\n", err)
+		return ""
+	}
+	result = strings.TrimSpace(result)
+	if result == "該当なし" || len(result) < 20 {
+		return ""
+	}
+	return result
+}
+
+// blueskyDeepDivePosts fetches and summarizes URLs from high-engagement posts.
+func blueskyDeepDivePosts(posts []BlueskyPost, config *Config) string {
+	// Filter posts with engagement >= 50 and external URL
+	var candidates []BlueskyPost
+	for _, p := range posts {
+		if p.EngagementScore() >= 50 && p.ExternalURL != "" {
+			candidates = append(candidates, p)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].EngagementScore() > candidates[j].EngagementScore()
+	})
+	if len(candidates) > 3 {
+		candidates = candidates[:3]
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	for _, p := range candidates {
+		text, _, _, err := scraplingFetch(p.ExternalURL, 3000, false)
+		if err != nil {
+			fmt.Printf("[siki] Bluesky deep-dive fetch failed for %s: %v\n", p.ExternalURL, err)
+			continue
+		}
+		if len(text) < 50 {
+			continue
+		}
+		name := p.AuthorName
+		if name == "" {
+			name = p.AuthorHandle
+		}
+		summaryPrompt := fmt.Sprintf(`以下のWebページ内容を3-5行で簡潔に要約してください。日本語で出力。
+
+URL: %s
+タイトル: %s
+共有者: %s (@%s)
+エンゲージメント: ❤%d 🔁%d 💬%d
+
+内容:
+%s`, p.ExternalURL, p.ExternalTitle, name, p.AuthorHandle, p.LikeCount, p.RepostCount, p.ReplyCount, truncateStr(text, 3000))
+
+		_, summary, err := callSubModel(summaryPrompt, config)
+		if err != nil {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("<h3><a href=\"%s\">%s</a></h3>\n", p.ExternalURL, p.ExternalTitle))
+		sb.WriteString(fmt.Sprintf("<p><em>共有: %s (@%s) | ❤%d 🔁%d</em></p>\n", name, p.AuthorHandle, p.LikeCount, p.RepostCount))
+		sb.WriteString(fmt.Sprintf("<p>%s</p>\n\n", strings.TrimSpace(summary)))
+	}
+	return sb.String()
+}
+
+// blueskyFeedLoop runs the background Bluesky feed fetcher (WebServer method).
+func (ws *WebServer) blueskyFeedLoop() {
+	// Initial delay
+	time.Sleep(30 * time.Second)
+
+	// First fetch
+	ws.runBlueskyFetch()
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		ws.runBlueskyFetch()
+	}
+}
+
+func (ws *WebServer) runBlueskyFetch() {
+	ws.mu.RLock()
+	enabled := ws.config.BlueskyEnabled
+	ws.mu.RUnlock()
+
+	if !enabled {
+		return
+	}
+
+	handles, err := resolveBlueskyHandles(ws.config)
+	if err != nil || len(handles) == 0 {
+		fmt.Printf("[siki] Bluesky: no handles to fetch (%v)\n", err)
+		return
+	}
+
+	fmt.Printf("[siki] Bluesky: fetching posts from %d handles...\n", len(handles))
+	newPosts := fetchAllBlueskyPosts(handles)
+	fmt.Printf("[siki] Bluesky: fetched %d new posts\n", len(newPosts))
+
+	feed := loadBlueskyFeed()
+	feed.Posts = mergeBlueskyPosts(feed.Posts, newPosts)
+	feed.LastFetched = time.Now()
+	if err := saveBlueskyFeed(feed); err != nil {
+		fmt.Printf("[siki] Bluesky: save failed: %v\n", err)
+	} else {
+		fmt.Printf("[siki] Bluesky: saved %d total posts\n", len(feed.Posts))
+	}
+}
+
+// filterBlueskyByIntent filters Bluesky posts by topic using LLM (like filterTweetsByIntent).
+func filterBlueskyByIntent(posts []BlueskyPost, intent string, config *Config, sendEvent func(StreamEvent)) []BlueskyPost {
+	if len(posts) == 0 {
+		return nil
+	}
+	// Build batch text
+	var sb strings.Builder
+	for i, p := range posts {
+		name := p.AuthorName
+		if name == "" {
+			name = p.AuthorHandle
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s: %s\n", i, name, p.AuthorHandle, p.Text))
+		if i >= 99 {
+			break
+		}
+	}
+
+	prompt := fmt.Sprintf(`以下のBluesky投稿リストから「%s」に関連する投稿の番号のみを出力してください。
+関連する投稿がない場合は「なし」と出力。番号はカンマ区切り。
+
+投稿リスト:
+%s
+
+関連番号:`, intent, truncateStr(sb.String(), 6000))
+
+	result, err := callFastModel(prompt, config)
+	if err != nil || strings.TrimSpace(result) == "なし" {
+		return posts // fallback: return all
+	}
+
+	// Parse indices
+	indices := parseIntList(strings.TrimSpace(result))
+	if len(indices) == 0 {
+		return posts
+	}
+
+	var filtered []BlueskyPost
+	for _, idx := range indices {
+		if idx >= 0 && idx < len(posts) {
+			filtered = append(filtered, posts[idx])
+		}
+	}
+	if len(filtered) == 0 {
+		return posts
+	}
+	return filtered
+}
+
+// parseIntList parses a comma-separated list of integers.
+func parseIntList(s string) []int {
+	parts := strings.Split(s, ",")
+	var result []int
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if n, err := strconv.Atoi(p); err == nil {
+			result = append(result, n)
+		}
+	}
+	return result
+}
+
+// containsBlueskyKeywords checks if the message is about Bluesky.
+func containsBlueskyKeywords(userMsg string) bool {
+	lower := strings.ToLower(userMsg)
+	keywords := []string{"bluesky", "bsky", "ブルースカイ"}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // cachedTwitterUserID caches the authenticated user's ID to avoid repeated /users/me calls.
@@ -10118,28 +10951,30 @@ var autonomousTasks = []struct {
 const idleThreadTitle = "sikiの思考ログ"
 const idleThreadIDPrefix = "idle-thoughts-"
 
-// getOrCreateIdleThread returns the thread ID for the dedicated idle thoughts thread.
-// Creates the thread if it doesn't exist.
+// getOrCreateIdleThread returns the thread ID for today's idle thoughts thread.
+// Each day gets a separate thread to prevent unbounded growth.
 func getOrCreateIdleThread() string {
 	if err := initThreadDir(); err != nil {
 		return ""
 	}
 
-	// Look for existing idle thread
+	today := time.Now().Format("2006-01-02")
+	todayID := idleThreadIDPrefix + today
+
+	// Look for today's idle thread
 	threads, err := listThreads()
 	if err == nil {
 		for _, t := range threads {
-			if strings.HasPrefix(t.ID, idleThreadIDPrefix) {
+			if t.ID == todayID {
 				return t.ID
 			}
 		}
 	}
 
-	// Create new idle thread
-	id := idleThreadIDPrefix + fmt.Sprintf("%d", time.Now().UnixMilli())
+	// Create today's idle thread
 	t := &Thread{
-		ID:        id,
-		Title:     idleThreadTitle,
+		ID:        todayID,
+		Title:     fmt.Sprintf("%s (%s)", idleThreadTitle, today),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -10147,8 +10982,21 @@ func getOrCreateIdleThread() string {
 		fmt.Printf("[siki] Failed to create idle thread: %v\n", err)
 		return ""
 	}
-	fmt.Printf("[siki] Created idle thoughts thread: %s\n", id)
-	return id
+	fmt.Printf("[siki] Created idle thoughts thread: %s\n", todayID)
+
+	// Prune old idle threads (keep last 7 days)
+	if threads != nil {
+		cutoff := time.Now().AddDate(0, 0, -7)
+		for _, t := range threads {
+			if strings.HasPrefix(t.ID, idleThreadIDPrefix) && t.UpdatedAt.Before(cutoff) {
+				os.Remove(filepath.Join(threadDir, t.ID+".json"))
+				os.Remove(filepath.Join(threadDir, t.ID+".jsonl"))
+				fmt.Printf("[siki] Pruned old idle thread: %s\n", t.ID)
+			}
+		}
+	}
+
+	return todayID
 }
 
 // runAutonomousThinking executes one idle thinking task and broadcasts results.
@@ -10250,6 +11098,37 @@ func (ws *WebServer) runAutonomousThinking() {
 		thread.UpdatedAt = time.Now()
 		saveThreadMeta(&thread)
 		fmt.Printf("[siki] Autonomous thinking: saved to idle thread %s\n", idleThreadID)
+
+		// Also log high-engagement Bluesky posts if available
+		if ws.config.BlueskyEnabled {
+			feed := loadBlueskyFeed()
+			recentPosts := filterRecentBlueskyPosts(feed.Posts, 6*time.Hour)
+			var notable []BlueskyPost
+			for _, p := range recentPosts {
+				if p.EngagementScore() >= 50 {
+					notable = append(notable, p)
+				}
+			}
+			if len(notable) > 0 {
+				if len(notable) > 5 {
+					notable = notable[:5]
+				}
+				var bskySb strings.Builder
+				bskySb.WriteString("【Bluesky注目ポスト】\n")
+				for _, p := range notable {
+					name := p.AuthorName
+					if name == "" {
+						name = p.AuthorHandle
+					}
+					bskySb.WriteString(fmt.Sprintf("- %s (@%s): %s [score=%d]\n", name, p.AuthorHandle, truncateStr(p.Text, 100), p.EngagementScore()))
+				}
+				appendToLog(idleThreadID, ThreadMessage{
+					Role:      "assistant",
+					Content:   bskySb.String(),
+					Timestamp: time.Now().Unix(),
+				})
+			}
+		}
 	}
 }
 
@@ -15200,6 +16079,7 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 			"twitter_consumer_secret": ws.config.TwitterConsumerSecret,
 			"twitter_access_token":    ws.config.TwitterAccessToken,
 			"twitter_access_secret":   ws.config.TwitterAccessSecret,
+			"bluesky_enabled":         ws.config.BlueskyEnabled,
 		})
 	case http.MethodPost:
 		var req struct {
@@ -15217,6 +16097,7 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 			TwitterConsumerSecret string `json:"twitter_consumer_secret"`
 			TwitterAccessToken    string `json:"twitter_access_token"`
 			TwitterAccessSecret   string `json:"twitter_access_secret"`
+			BlueskyEnabled        bool   `json:"bluesky_enabled"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -15243,6 +16124,7 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 		ws.config.TwitterConsumerSecret = req.TwitterConsumerSecret
 		ws.config.TwitterAccessToken = req.TwitterAccessToken
 		ws.config.TwitterAccessSecret = req.TwitterAccessSecret
+		ws.config.BlueskyEnabled = req.BlueskyEnabled
 		cachedTwitterUserID = ""
 		// Persist to file
 		dc := &DigestConfig{
@@ -15260,6 +16142,7 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 			TwitterConsumerSecret: ws.config.TwitterConsumerSecret,
 			TwitterAccessToken:    ws.config.TwitterAccessToken,
 			TwitterAccessSecret:   ws.config.TwitterAccessSecret,
+			BlueskyEnabled:        ws.config.BlueskyEnabled,
 		}
 		ws.mu.Unlock()
 		if err := saveDigestConfig(dc); err != nil {
@@ -16405,6 +17288,9 @@ func runWeb(config *Config, host string, port int) error {
 
 	// Start email digest loop
 	go ws.digestLoop()
+
+	// Start Bluesky feed background loop
+	go ws.blueskyFeedLoop()
 
 	// Open browser automatically (only for localhost)
 	if host != "0.0.0.0" {
