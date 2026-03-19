@@ -23,3 +23,10 @@ coverage.out
 # Temporary files
 *.tmp
 *.log
+
+# Secrets / credentials (never commit)
+digest_config.json
+*.env
+.env*
+credentials.json
+api_keys.json

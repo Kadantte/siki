@@ -10857,8 +10857,22 @@ func (ws *WebServer) analyzeJetstreamDay(t time.Time, config *Config) {
 			var score int
 			if ogpTitle != "" || ogpDesc != "" {
 				evalPrompt := fmt.Sprintf(`以下のBlueskyポストとそのリンク先を10点満点で評価してください。
-AI・テクノロジー・プログラミング・科学に関連する有益な情報ほど高得点。
-雑談・広告・無関係な内容は低得点。
+
+## 高得点の基準（7点以上）
+- AI・機械学習・深層学習・LLM・生成AIに直接関連する技術情報
+- 新しいモデル発表、ベンチマーク結果、研究論文、アーキテクチャ解説
+- AI応用事例（画像生成、音声認識、自然言語処理、ロボティクス等）
+- AIフレームワーク・ライブラリの重要アップデート
+
+## 中程度（4-6点）
+- プログラミング・ソフトウェア開発の一般的な技術情報
+- AI以外の科学・テクノロジーニュース
+- AIに間接的に関連する話題（GPU、クラウド、データ基盤等）
+
+## 低得点（3点以下）
+- AIと無関係な一般ニュース・雑談 → 1-2点
+- 広告・宣伝・マーケティング → 1点
+- 内容が薄い・感想だけ → 2点
 
 ポスト: %s
 リンク先タイトル: %s
@@ -10979,19 +10993,28 @@ func (ws *WebServer) evaluateDeliveryPriority(config *Config) {
 			}
 
 			prompt := fmt.Sprintf(`以下の記事を0-100のスケールで配信優先度を評価してください。
+読者はAI研究者・エンジニアです。AI関連の重要情報を厳選して届けることが目的です。
 
 ## 評価基準
-- 技術的な新規性・独創性 (30点)
-- 実務への影響度・活用可能性 (25点)
-- AI/プログラミング/科学の最先端トピックか (25点)
-- 情報の信頼性・ソースの質 (10点)
-- 話題性・タイムリーさ (10点)
+- AI・機械学習との直接的関連性 (35点): LLM、生成AI、深層学習、強化学習、モデルアーキテクチャ、学習手法、推論最適化など。AI無関係なら0点。
+- 技術的な新規性・独創性 (25点): 新モデル、新手法、ベンチマーク更新、未発表の研究成果など。既知情報の焼き直しは0点。
+- 実務への影響度 (20点): AIエンジニアの仕事やワークフローに直接影響するか。
+- 情報の深さ・質 (10点): 技術的詳細があるか、表面的でないか。
+- 話題性・タイムリーさ (10点): 今知るべき情報か。
+
+## 高評価の例（70-100点）
+- 新しいLLMモデルの発表・ベンチマーク比較
+- 画期的なAI研究論文の解説
+- 主要AIフレームワークの重大アップデート
+- AI規制・政策の重要な動き
 
 ## 低評価にすべきもの
-- 既知の情報の焼き直し → 20以下
-- 宣伝・マーケティング色が強い → 15以下
-- 内容が薄い・表面的 → 25以下
-- 単なるツール紹介で深みがない → 30以下
+- AIと無関係な一般技術ニュース → 10以下
+- 既知の情報の焼き直し → 15以下
+- 宣伝・マーケティング色が強い → 10以下
+- 内容が薄い・表面的 → 20以下
+- 単なるツール紹介で深みがない → 25以下
+- AI関連だが感想・意見だけで技術的内容なし → 30以下
 
 ## Blueskyポスト
 %s
@@ -18585,27 +18608,50 @@ func (ws *WebServer) handleDigestSettings(w http.ResponseWriter, r *http.Request
 			return
 		}
 		ws.mu.Lock()
-		ws.config.EmailTo = req.EmailTo
-		ws.config.EmailFrom = req.EmailFrom
-		ws.config.SMTPHost = req.SMTPHost
+		// Only overwrite fields that were explicitly provided (non-empty)
+		if req.EmailTo != "" {
+			ws.config.EmailTo = req.EmailTo
+		}
+		if req.EmailFrom != "" {
+			ws.config.EmailFrom = req.EmailFrom
+		}
+		if req.SMTPHost != "" {
+			ws.config.SMTPHost = req.SMTPHost
+		}
 		if req.SMTPPort > 0 {
 			ws.config.SMTPPort = req.SMTPPort
 		}
-		ws.config.SMTPUser = req.SMTPUser
+		if req.SMTPUser != "" {
+			ws.config.SMTPUser = req.SMTPUser
+		}
 		if req.SMTPPass != "" {
 			ws.config.SMTPPass = req.SMTPPass
 		}
-		ws.config.DigestEnabled = req.DigestEnabled
+		// Boolean fields: only update if the request was a full settings save (has email_to)
+		// This prevents partial API calls from resetting booleans to false
+		if req.EmailTo != "" || req.SMTPHost != "" {
+			ws.config.DigestEnabled = req.DigestEnabled
+			ws.config.TwitterEnabled = req.TwitterEnabled
+			ws.config.BlueskyEnabled = req.BlueskyEnabled
+		}
 		if len(req.DigestHours) > 0 {
 			ws.config.DigestHours = req.DigestHours
 		}
-		ws.config.TwitterEnabled = req.TwitterEnabled
-		ws.config.TwitterBearerToken = req.TwitterBearerToken
-		ws.config.TwitterConsumerKey = req.TwitterConsumerKey
-		ws.config.TwitterConsumerSecret = req.TwitterConsumerSecret
-		ws.config.TwitterAccessToken = req.TwitterAccessToken
-		ws.config.TwitterAccessSecret = req.TwitterAccessSecret
-		ws.config.BlueskyEnabled = req.BlueskyEnabled
+		if req.TwitterBearerToken != "" {
+			ws.config.TwitterBearerToken = req.TwitterBearerToken
+		}
+		if req.TwitterConsumerKey != "" {
+			ws.config.TwitterConsumerKey = req.TwitterConsumerKey
+		}
+		if req.TwitterConsumerSecret != "" {
+			ws.config.TwitterConsumerSecret = req.TwitterConsumerSecret
+		}
+		if req.TwitterAccessToken != "" {
+			ws.config.TwitterAccessToken = req.TwitterAccessToken
+		}
+		if req.TwitterAccessSecret != "" {
+			ws.config.TwitterAccessSecret = req.TwitterAccessSecret
+		}
 		if req.BlueskyIdentifier != "" {
 			ws.config.BlueskyIdentifier = req.BlueskyIdentifier
 		}
