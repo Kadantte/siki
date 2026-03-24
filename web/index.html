@@ -346,6 +346,34 @@
             border-bottom-left-radius: 4px;
         }
 
+        /* TTS (text-to-speech) button */
+        .tts-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px; height: 22px;
+            border: none; background: transparent;
+            cursor: pointer; opacity: 0;
+            transition: opacity 0.15s;
+            vertical-align: middle;
+            margin-left: 4px;
+            padding: 0;
+            border-radius: 3px;
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+        .tts-btn:hover { opacity: 1 !important; background: var(--hover-bg, rgba(128,128,128,0.15)); }
+        .tts-btn.playing { opacity: 1; color: var(--accent, #e94560); }
+        .tts-btn.loading { opacity: 0.7; }
+        .message.assistant:hover .tts-btn { opacity: 0.5; }
+        .message.assistant p,
+        .message.assistant h1,
+        .message.assistant h2,
+        .message.assistant h3,
+        .message.assistant h4,
+        .message.assistant li,
+        .message.assistant blockquote { position: relative; }
+
         .message.thinking {
             background: rgba(233, 69, 96, 0.06);
             border: 1px solid rgba(233, 69, 96, 0.2);
@@ -1422,6 +1450,7 @@
                 <div class="docker-status-dot" id="docker-status-dot"></div>
                 <span id="docker-status-text">Docker</span>
             </div>
+            <button class="settings-btn" onclick="triggerNewsShow()" title="AI News Show生成">📺Show</button>
             <button class="settings-btn" onclick="showJetstreamMonitor()">Monitor</button>
             <button class="settings-btn" onclick="showProfile()">Profile</button>
             <button class="settings-btn" onclick="showSettings()" data-i18n="settings">Settings</button>
@@ -2579,9 +2608,10 @@
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
 
-            // Fetch link previews for assistant messages
+            // Fetch link previews and add TTS buttons for assistant messages
             if (role === 'assistant' && !toolName) {
                 fetchLinkPreviews(div);
+                addTTSButtons(div);
             }
 
             return div;
@@ -2603,6 +2633,14 @@
                 return `SIKIFRAME${iframes.length - 1}ENDFRAME`;
             });
 
+            // Also protect <video> tags from markdown sanitization
+            const videoPattern = /<video[^>]*>[\s\S]*?<\/video>/gi;
+            const videos = [];
+            protectedContent = protectedContent.replace(videoPattern, (match) => {
+                videos.push(match);
+                return `SIKIVIDEO${videos.length - 1}ENDVIDEO`;
+            });
+
             // Parse markdown
             let html = marked.parse(protectedContent);
 
@@ -2614,6 +2652,16 @@
                     replacement = `<div class="diagram-inline">${iframe}<br><button class="popout-btn" onclick="window.open('${srcMatch[1]}', '_blank', 'width=1200,height=800')">↗ Pop out</button></div>`;
                 }
                 html = html.replace(`SIKIFRAME${index}ENDFRAME`, replacement);
+            });
+
+            // Restore video tags with styled container
+            videos.forEach((video, index) => {
+                const srcMatch = video.match(/src="([^"]+)"/);
+                let replacement = `<div class="video-container" style="margin:12px 0;">${video}</div>`;
+                if (srcMatch) {
+                    replacement = `<div class="video-container" style="margin:12px 0;">${video}<br><button class="popout-btn" onclick="window.open('${srcMatch[1]}', '_blank')">↗ 別ウィンドウで開く</button></div>`;
+                }
+                html = html.replace(`SIKIVIDEO${index}ENDVIDEO`, replacement);
             });
 
             // Wrap playground images with expand container
@@ -2675,8 +2723,126 @@
             } else {
                 div.innerHTML = renderMarkdown(content);
                 fetchLinkPreviews(div);
+                addTTSButtons(div);
             }
             chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        // --- TTS (text-to-speech) click-to-speak ---
+        let currentTTSAudio = null;
+        let currentTTSBtn = null;
+        let currentTTSAbort = null; // AbortController for in-flight fetch
+        let ttsRequestId = 0;      // monotonic ID to detect stale responses
+
+        function addTTSButtons(msgEl) {
+            if (!msgEl.classList.contains('assistant')) return;
+            // Add speaker button to paragraphs, list items, headings, blockquotes
+            const targets = msgEl.querySelectorAll('p, li, h1, h2, h3, h4, blockquote');
+            targets.forEach(el => {
+                if (el.querySelector('.tts-btn')) return;
+                // Skip if parent already has a button (e.g. <p> inside <blockquote>)
+                if (el.parentElement && el.parentElement.closest && el.parentElement.closest('[class*="tts-btn"]')) return;
+                const text = el.textContent.trim();
+                if (text.length < 5) return; // skip very short
+                const btn = document.createElement('button');
+                btn.className = 'tts-btn';
+                btn.title = '読み上げ';
+                btn.innerHTML = '&#x1f50a;';
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    speakText(text, btn);
+                });
+                el.style.position = 'relative';
+                el.appendChild(btn);
+            });
+        }
+
+        function stopTTS() {
+            // Abort any in-flight fetch
+            if (currentTTSAbort) {
+                currentTTSAbort.abort();
+                currentTTSAbort = null;
+            }
+            // Stop any playing audio
+            if (currentTTSAudio) {
+                currentTTSAudio.pause();
+                currentTTSAudio.currentTime = 0;
+                currentTTSAudio = null;
+            }
+            // Reset button state
+            if (currentTTSBtn) {
+                currentTTSBtn.classList.remove('playing', 'loading');
+                currentTTSBtn.innerHTML = '&#x1f50a;';
+                currentTTSBtn = null;
+            }
+        }
+
+        async function speakText(text, btn) {
+            const wasSameBtn = (currentTTSBtn === btn);
+            // Always stop everything first
+            stopTTS();
+            // If toggling off the same button, just stop
+            if (wasSameBtn) return;
+
+            // Start new request
+            const myId = ++ttsRequestId;
+            const abort = new AbortController();
+            currentTTSAbort = abort;
+            currentTTSBtn = btn;
+
+            btn.classList.add('loading');
+            btn.innerHTML = '&#x23f3;';
+
+            try {
+                const resp = await fetch('/api/tts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text, speed: 1.2 }),
+                    signal: abort.signal
+                });
+                // Check if this request was superseded
+                if (myId !== ttsRequestId) return;
+                if (!resp.ok) throw new Error(await resp.text());
+                const blob = await resp.blob();
+                if (myId !== ttsRequestId) return;
+
+                const url = URL.createObjectURL(blob);
+                const audio = new Audio(url);
+                currentTTSAudio = audio;
+                currentTTSAbort = null;
+
+                btn.classList.remove('loading');
+                btn.classList.add('playing');
+                btn.innerHTML = '&#x23f9;';
+
+                audio.onended = () => {
+                    if (currentTTSBtn === btn) {
+                        btn.classList.remove('playing');
+                        btn.innerHTML = '&#x1f50a;';
+                        currentTTSAudio = null;
+                        currentTTSBtn = null;
+                    }
+                    URL.revokeObjectURL(url);
+                };
+                audio.onerror = () => {
+                    if (currentTTSBtn === btn) {
+                        btn.classList.remove('playing', 'loading');
+                        btn.innerHTML = '&#x1f50a;';
+                        currentTTSAudio = null;
+                        currentTTSBtn = null;
+                    }
+                };
+                audio.play();
+            } catch (err) {
+                if (err.name === 'AbortError') return; // intentional cancel
+                console.error('TTS error:', err);
+                if (myId === ttsRequestId && currentTTSBtn === btn) {
+                    btn.classList.remove('loading');
+                    btn.innerHTML = '&#x1f50a;';
+                    currentTTSBtn = null;
+                }
+            }
         }
 
         // Fetch representative images for URLs in a message element
@@ -2792,7 +2958,8 @@
             const autoThreads = [];
             for (const t of sorted) {
                 const isIdleThread = t.id && t.id.startsWith('idle-thoughts-');
-                const isProactive = t.proactive || (t.id && t.id.startsWith('proactive-'));
+                const isReport = t.id && (t.id.startsWith('newsshow-') || t.id.startsWith('bluesky-report-') || t.id.startsWith('digest-'));
+                const isProactive = !isReport && (t.proactive || (t.id && t.id.startsWith('proactive-')));
                 if (isIdleThread || isProactive) {
                     autoThreads.push(t);
                 } else {
@@ -2996,6 +3163,7 @@
                                 div.className = 'message assistant summarized-marker';
                                 div.innerHTML = '<details><summary>--- AI要約 (この時点でLLMコンテキストが要約されました) ---</summary>' + renderMarkdown(m.content) + '</details>';
                                 chatContainer.appendChild(div);
+                                addTTSButtons(div);
                             } else {
                                 addMessage('assistant', m.content);
                             }
@@ -3580,6 +3748,21 @@
         // ============================================
         // Jetstream Monitor
         // ============================================
+        async function triggerNewsShow() {
+            if (!confirm('AI News Showを生成しますか？\n（数分かかります）')) return;
+            try {
+                const resp = await fetch('/api/newsshow', { method: 'POST' });
+                const data = await resp.json();
+                if (resp.ok) {
+                    addMessage('assistant', `📺 AI News Show生成を開始しました（${data.articles}件の記事）。完了するとスレッドに表示されます。`);
+                } else {
+                    addMessage('assistant', '⚠️ News Show生成に失敗: ' + (data.error || resp.statusText));
+                }
+            } catch(e) {
+                addMessage('assistant', '⚠️ News Show API エラー: ' + e.message);
+            }
+        }
+
         async function showJetstreamMonitor() {
             document.getElementById('jetstream-modal').classList.add('show');
             // Load stats

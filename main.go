@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -189,9 +190,9 @@ func defaultConfig() *Config {
 	home, _ := os.UserHomeDir()
 	return &Config{
 		ModelPath:   filepath.Join(home, ".siki", "models"),
-		ModelName:   "openai/gpt-oss-20b",
-		Backend:     "vllm",
-		APIEndpoint: "http://localhost:8001/v1",
+		ModelName:   "gpt-oss:latest",
+		Backend:     "ollama",
+		APIEndpoint: "http://localhost:11434/v1",
 		Workspace:   ".",
 		MaxTurns:    MaxTurns,
 		VisionModel: "moondream",
@@ -281,7 +282,7 @@ func detectBackend() string {
 	}
 	// Check for NVIDIA GPU
 	if _, err := exec.LookPath("nvidia-smi"); err == nil {
-		return "vllm"
+		return "ollama"
 	}
 	return "ollama"
 }
@@ -3406,8 +3407,27 @@ func isSubModelVLLM(config *Config) bool {
 	return config.SubModelBackend == "vllm"
 }
 
-// callOrchestratorGenerate calls the orchestrator model (falls back to sub-model if not configured).
+// callOrchestratorGenerate calls the orchestrator model with fallback to sub-model on failure.
 func callOrchestratorGenerate(prompt string, maxTokens int, timeout time.Duration, config *Config) (string, error) {
+	// Cap timeout to 90s to avoid hanging forever
+	if timeout > 90*time.Second {
+		timeout = 90 * time.Second
+	}
+
+	result, err := callOrchestratorGenerateInner(prompt, maxTokens, timeout, config)
+	if err != nil {
+		// Fallback to sub-model
+		fmt.Printf("[siki] Orchestrator failed (%v), falling back to sub-model\n", err)
+		_, content, err2 := callSubModel(prompt, config)
+		if err2 != nil {
+			return "", fmt.Errorf("orchestrator failed: %v; sub-model fallback also failed: %v", err, err2)
+		}
+		return content, nil
+	}
+	return result, nil
+}
+
+func callOrchestratorGenerateInner(prompt string, maxTokens int, timeout time.Duration, config *Config) (string, error) {
 	model := config.orchestratorModel()
 	endpoint := config.orchestratorEndpoint()
 	isVLLM := config.orchestratorBackend() == "vllm"
@@ -3487,7 +3507,7 @@ func isSubAgentVLLM(config *Config) bool {
 	if config.SubAgentBackend != "" {
 		return config.SubAgentBackend == "vllm"
 	}
-	return true // default to vllm for sub-agent (typically large models)
+	return false // default to ollama
 }
 
 // callSubAgent calls the sub-agent model for complex tasks.
@@ -7279,9 +7299,9 @@ func preWarmSubModel(config *Config) {
 		if orchModel != "" && orchModel != config.SubModel {
 			fmt.Printf("[siki] Pre-warming orchestrator: %s ...\n", orchModel)
 			start2 := time.Now()
-			_, err2 := callOllamaGenerate(orchModel, "Say OK.", 5, 600*time.Second, config)
+			_, err2 := callOllamaGenerate(orchModel, "Say OK.", 5, 90*time.Second, config)
 			if err2 != nil {
-				fmt.Printf("[siki] Orchestrator warm-up failed: %v\n", err2)
+				fmt.Printf("[siki] Orchestrator warm-up failed (will use sub-model as fallback): %v\n", err2)
 			} else {
 				fmt.Printf("[siki] Orchestrator ready (%.1fs)\n", time.Since(start2).Seconds())
 			}
@@ -10828,8 +10848,8 @@ func (ws *WebServer) analyzeJetstreamDay(t time.Time, config *Config) {
 		return
 	}
 
-	// Process up to 10 posts per cycle
-	limit := 10
+	// Process up to 50 posts per cycle
+	limit := 50
 	if len(candidates) < limit {
 		limit = len(candidates)
 	}
@@ -10837,8 +10857,8 @@ func (ws *WebServer) analyzeJetstreamDay(t time.Time, config *Config) {
 
 	fmt.Printf("[siki] Jetstream analyze: processing %d posts with URLs (%s)\n", limit, t.Format("01/02"))
 
-	// Concurrent processing (max 5 parallel)
-	sem := make(chan struct{}, 5)
+	// Concurrent processing (max 2 parallel for sub-model)
+	sem := make(chan struct{}, 2)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -10883,7 +10903,7 @@ JSON形式で回答（他の文字不要）:
 					truncateStr(cand.text, 500),
 					truncateStr(ogpTitle, 200),
 					truncateStr(ogpDesc, 500))
-				result, err := callFastModel(evalPrompt, config, 200)
+				_, result, err := callSubModel(evalPrompt, config)
 				if err == nil {
 					result = strings.TrimSpace(result)
 					if idx := strings.Index(result, "{"); idx >= 0 {
@@ -10958,18 +10978,21 @@ func (ws *WebServer) evaluateDeliveryPriority(config *Config) {
 		return
 	}
 
-	// Process up to 5 per cycle to avoid overload
+	// Sort by score descending and process all in batches
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].meta.Score > candidates[j].meta.Score
 	})
-	if len(candidates) > 5 {
-		candidates = candidates[:5]
+
+	// Cap per cycle to avoid overloading the model
+	if len(candidates) > 50 {
+		candidates = candidates[:50]
 	}
+	total := len(candidates)
+	fmt.Printf("[siki] Delivery eval: evaluating %d posts for priority...\n", total)
 
-	fmt.Printf("[siki] Delivery eval: evaluating %d posts for priority...\n", len(candidates))
-
-	sem := make(chan struct{}, 3)
+	sem := make(chan struct{}, 2) // Lower concurrency for sub-model
 	var wg sync.WaitGroup
+	var done int64
 
 	for _, c := range candidates {
 		wg.Add(1)
@@ -10977,6 +11000,12 @@ func (ws *WebServer) evaluateDeliveryPriority(config *Config) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			defer func() {
+				n := atomic.AddInt64(&done, 1)
+				if n%10 == 0 || int(n) == total {
+					fmt.Printf("[siki] Delivery eval: progress %d/%d\n", n, total)
+				}
+			}()
 
 			// Fetch page content
 			_, pageText, _, err := scraplingFetch(cand.meta.URL, 3000, false)
@@ -11031,7 +11060,7 @@ JSON形式で回答: {"priority": 数値0-100, "summary": "日本語で2-3文の
 				cand.meta.URL,
 				truncateStr(pageText, 2500))
 
-			resp, err := callFastModel(prompt, config, 500)
+			_, resp, err := callSubModel(prompt, config)
 			if err != nil {
 				return
 			}
@@ -11125,6 +11154,13 @@ var (
 	lastJetstreamReportMu   sync.Mutex
 )
 
+// deepDiveResult holds data for a single article in the Jetstream deep-dive report.
+type deepDiveResult struct {
+	meta       JetstreamPostMeta
+	report     string // LLM-generated deep-dive
+	screenshot []byte // PNG bytes (may be nil)
+}
+
 // jetstreamDeepDiveReport finds high-score unreported posts, deep-dives their URLs,
 // takes screenshots, generates SVG chart and report, and emails it.
 // Rate-limited to max 3 times per day (every 8 hours).
@@ -11194,11 +11230,6 @@ func (ws *WebServer) jetstreamDeepDiveReport() {
 	fmt.Printf("[siki] Jetstream report: deep-diving %d high-score posts...\n", len(candidates))
 
 	// Deep-dive each URL with screenshot
-	type deepDiveResult struct {
-		meta       JetstreamPostMeta
-		report     string // LLM-generated deep-dive
-		screenshot []byte // PNG bytes (may be nil)
-	}
 	var results []deepDiveResult
 	sem := make(chan struct{}, 3)
 	var mu sync.Mutex
@@ -11362,9 +11393,72 @@ HTML形式（<h3>, <p>, <ul><li>, <strong>タグ使用）で出力。見出し�
 	subject := fmt.Sprintf("Bluesky注目記事レポート (%d件) - %s", len(results), now.Format("01/02"))
 	if err := sendEmailWithImages(config, subject, htmlBuf.String(), images); err != nil {
 		fmt.Printf("[siki] Jetstream report: email send failed: %v\n", err)
-		return
+		// Continue to save thread even if email fails
+	} else {
+		fmt.Printf("[siki] Jetstream report: sent %d articles (%d screenshots) to %s\n", len(results), len(images), emailTo)
 	}
-	fmt.Printf("[siki] Jetstream report: sent %d articles (%d screenshots) to %s\n", len(results), len(images), emailTo)
+
+	// Save report as a thread for in-app viewing
+	go func() {
+		threadID := fmt.Sprintf("bluesky-report-%s", now.Format("20060102-1504"))
+		// Build markdown content for thread
+		var mdBuf strings.Builder
+		mdBuf.WriteString(fmt.Sprintf("# Bluesky 注目記事レポート\n\n%s — Jetstream監視で発見した注目記事（%d件）\n\n---\n\n", now.Format("2006年01月02日 15:04"), len(results)))
+		for i, r := range results {
+			mdBuf.WriteString(fmt.Sprintf("## %d. %s\n\n", i+1, r.meta.OGPTitle))
+			mdBuf.WriteString(fmt.Sprintf("**優先度: %d/100** | [記事を読む](%s)\n\n", r.meta.DeliveryPriority, r.meta.URL))
+			if r.meta.DeepSummary != "" {
+				mdBuf.WriteString(fmt.Sprintf("> %s\n\n", r.meta.DeepSummary))
+			} else if r.meta.PostText != "" {
+				mdBuf.WriteString(fmt.Sprintf("> %s\n\n", truncateStr(r.meta.PostText, 200)))
+			}
+			// Save screenshot to playground and reference it
+			if len(r.screenshot) > 0 {
+				ssName := fmt.Sprintf("bsky_report_%s_%d.png", now.Format("20060102"), i+1)
+				ssPath := filepath.Join(playgroundDir, ssName)
+				if err := os.WriteFile(ssPath, r.screenshot, 0644); err == nil {
+					mdBuf.WriteString(fmt.Sprintf("![screenshot](/playground/%s)\n\n", ssName))
+				}
+			} else if r.meta.OGPImage != "" {
+				mdBuf.WriteString(fmt.Sprintf("![ogp](%s)\n\n", r.meta.OGPImage))
+			}
+			// Strip HTML tags from report for markdown
+			reportMd := r.report
+			// Simple HTML → markdown conversions
+			for _, tag := range []string{"<h3>", "<h4>"} {
+				reportMd = strings.ReplaceAll(reportMd, tag, "### ")
+			}
+			for _, tag := range []string{"</h3>", "</h4>"} {
+				reportMd = strings.ReplaceAll(reportMd, tag, "\n")
+			}
+			reportMd = strings.ReplaceAll(reportMd, "<strong>", "**")
+			reportMd = strings.ReplaceAll(reportMd, "</strong>", "**")
+			reportMd = strings.ReplaceAll(reportMd, "<li>", "- ")
+			reportMd = strings.ReplaceAll(reportMd, "</li>", "\n")
+			for _, tag := range []string{"<p>", "</p>", "<ul>", "</ul>", "<ol>", "</ol>", "<br>", "<br/>", "<div>", "</div>"} {
+				reportMd = strings.ReplaceAll(reportMd, tag, "\n")
+			}
+			mdBuf.WriteString(reportMd)
+			mdBuf.WriteString("\n\n---\n\n")
+		}
+
+		// Create thread with the report
+		t := &Thread{
+			ID:        threadID,
+			Title:     subject,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := saveThread(t); err != nil {
+			fmt.Printf("[siki] Jetstream report: failed to save thread: %v\n", err)
+			return
+		}
+		appendMessageToThread(threadID, Message{
+			Role:    "assistant",
+			Content: mdBuf.String(),
+		}, "")
+		fmt.Printf("[siki] Jetstream report: saved thread '%s'\n", threadID)
+	}()
 
 	// Record send time for rate limiting
 	lastJetstreamReportMu.Lock()
@@ -11380,6 +11474,829 @@ HTML形式（<h3>, <p>, <ul><li>, <strong>タグ使用）で出力。見出し�
 			saveJetstreamMeta(c.day, meta)
 		}
 	}
+
+	// Trigger AI news show generation from this report
+	go ws.generateNewsShow(results)
+}
+
+// ============================================================================
+// AI News Show (自動ニュース番組生成)
+// ============================================================================
+
+// newsShowCharDir returns the directory for cached character images.
+func newsShowCharDir() string {
+	home, _ := os.UserHomeDir()
+	d := filepath.Join(home, ".siki", "newsshow", "characters")
+	os.MkdirAll(d, 0755)
+	return d
+}
+
+// newsShowTmpDir returns a temp dir for news show generation.
+func newsShowTmpDir() string {
+	d := filepath.Join(os.TempDir(), "siki_newsshow")
+	os.MkdirAll(d, 0755)
+	return d
+}
+
+// Character emotions for news show
+var newsShowEmotions = []string{"neutral", "happy", "angry", "sad", "surprised", "thinking"}
+
+// newsShowCharacterPrompts returns FLUX prompts for generating character images.
+func newsShowCharacterPrompts() map[string]map[string]string {
+	base := map[string]map[string]string{
+		"sakura": {
+			"neutral":   "anime style portrait of a young Japanese female news anchor, professional outfit, blue blazer, warm smile, simple studio background, upper body, facing camera, high quality illustration",
+			"happy":     "anime style portrait of a young Japanese female news anchor, professional outfit, blue blazer, very happy laughing expression, simple studio background, upper body, facing camera, high quality illustration",
+			"angry":     "anime style portrait of a young Japanese female news anchor, professional outfit, blue blazer, frustrated annoyed expression, simple studio background, upper body, facing camera, high quality illustration",
+			"sad":       "anime style portrait of a young Japanese female news anchor, professional outfit, blue blazer, sad worried expression, simple studio background, upper body, facing camera, high quality illustration",
+			"surprised": "anime style portrait of a young Japanese female news anchor, professional outfit, blue blazer, shocked surprised expression with open mouth, simple studio background, upper body, facing camera, high quality illustration",
+			"thinking":  "anime style portrait of a young Japanese female news anchor, professional outfit, blue blazer, thinking pondering expression with hand on chin, simple studio background, upper body, facing camera, high quality illustration",
+		},
+		"haruki": {
+			"neutral":   "anime style portrait of a sleek humanoid robot AI assistant, white and blue metallic body, LED eyes, calm neutral expression, simple studio background, upper body, facing camera, high quality illustration",
+			"happy":     "anime style portrait of a sleek humanoid robot AI assistant, white and blue metallic body, LED eyes glowing bright, happy cheerful expression, simple studio background, upper body, facing camera, high quality illustration",
+			"angry":     "anime style portrait of a sleek humanoid robot AI assistant, white and blue metallic body, LED eyes glowing red, stern serious expression, simple studio background, upper body, facing camera, high quality illustration",
+			"sad":       "anime style portrait of a sleek humanoid robot AI assistant, white and blue metallic body, LED eyes dim, sad drooping expression, simple studio background, upper body, facing camera, high quality illustration",
+			"surprised": "anime style portrait of a sleek humanoid robot AI assistant, white and blue metallic body, LED eyes wide bright, shocked surprised expression, simple studio background, upper body, facing camera, high quality illustration",
+			"thinking":  "anime style portrait of a sleek humanoid robot AI assistant, white and blue metallic body, LED eyes blinking, thinking analytical expression, simple studio background, upper body, facing camera, high quality illustration",
+		},
+	}
+	return base
+}
+
+// waitForImageServerReady waits for the image server model to be fully loaded.
+func waitForImageServerReady(config *Config, timeout time.Duration) error {
+	if err := ensureImageServer(config); err != nil {
+		return err
+	}
+	endpoint := config.ImageEndpoint
+	if endpoint == "" {
+		endpoint = "http://localhost:8100"
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(endpoint + "/health")
+		if err == nil {
+			var health struct {
+				Status      string `json:"status"`
+				ModelLoaded bool   `json:"model_loaded"`
+			}
+			json.NewDecoder(resp.Body).Decode(&health)
+			resp.Body.Close()
+			if health.ModelLoaded {
+				return nil
+			}
+			fmt.Printf("[newsshow] Image server loading... (%s)\n", health.Status)
+		}
+		time.Sleep(10 * time.Second)
+	}
+	return fmt.Errorf("image server model not ready after %s", timeout)
+}
+
+// ensureCharacterImages generates character images if they don't exist.
+func ensureCharacterImages(config *Config) error {
+	charDir := newsShowCharDir()
+	prompts := newsShowCharacterPrompts()
+
+	// Check if any images need generating
+	needGen := false
+	for char, emotions := range prompts {
+		for emotion := range emotions {
+			imgPath := filepath.Join(charDir, fmt.Sprintf("%s_%s.png", char, emotion))
+			if _, err := os.Stat(imgPath); err != nil {
+				needGen = true
+				break
+			}
+		}
+		if needGen {
+			break
+		}
+	}
+	if !needGen {
+		fmt.Printf("[newsshow] All character images already cached\n")
+		return nil
+	}
+
+	// Wait for image server to be fully ready (model loaded)
+	fmt.Printf("[newsshow] Waiting for image server to be ready...\n")
+	if err := waitForImageServerReady(config, 5*time.Minute); err != nil {
+		return fmt.Errorf("image server not ready: %w", err)
+	}
+
+	for char, emotions := range prompts {
+		for emotion, prompt := range emotions {
+			imgPath := filepath.Join(charDir, fmt.Sprintf("%s_%s.png", char, emotion))
+			if _, err := os.Stat(imgPath); err == nil {
+				continue // Already exists
+			}
+			fmt.Printf("[newsshow] Generating character: %s_%s\n", char, emotion)
+			urlPath, err := generateImage(prompt, 512, 512, config)
+			if err != nil {
+				fmt.Printf("[newsshow] Failed to generate %s_%s: %v (retrying...)\n", char, emotion, err)
+				// Retry once after a short wait
+				time.Sleep(5 * time.Second)
+				urlPath, err = generateImage(prompt, 512, 512, config)
+				if err != nil {
+					fmt.Printf("[newsshow] Retry failed for %s_%s: %v\n", char, emotion, err)
+					continue
+				}
+			}
+			// Copy from playground to character dir
+			srcPath := filepath.Join(playgroundDir, filepath.Base(urlPath))
+			data, err := os.ReadFile(srcPath)
+			if err != nil {
+				fmt.Printf("[newsshow] Failed to read generated image: %v\n", err)
+				continue
+			}
+			if err := os.WriteFile(imgPath, data, 0644); err != nil {
+				fmt.Printf("[newsshow] Failed to save character image: %v\n", err)
+				continue
+			}
+			fmt.Printf("[newsshow] Generated: %s_%s.png\n", char, emotion)
+		}
+	}
+	return nil
+}
+
+// getCharacterImage returns the path to a character's emotion image, with fallback.
+func getCharacterImage(char, emotion string) string {
+	charDir := newsShowCharDir()
+	imgPath := filepath.Join(charDir, fmt.Sprintf("%s_%s.png", char, emotion))
+	if _, err := os.Stat(imgPath); err == nil {
+		return imgPath
+	}
+	// Fallback to neutral
+	imgPath = filepath.Join(charDir, fmt.Sprintf("%s_neutral.png", char))
+	if _, err := os.Stat(imgPath); err == nil {
+		return imgPath
+	}
+	// Generate placeholder with ffmpeg
+	placeholder := filepath.Join(charDir, fmt.Sprintf("%s_%s_placeholder.png", char, emotion))
+	if _, err := os.Stat(placeholder); err == nil {
+		return placeholder
+	}
+	color := "0x4ECDC4" // teal for haruki
+	label := "HARUKI"
+	if char == "sakura" {
+		color = "0xE94560" // pink for sakura
+		label = "SAKURA"
+	}
+	fontPath := "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+	cmd := exec.Command("ffmpeg", "-y", "-f", "lavfi", "-i",
+		fmt.Sprintf("color=c=%s:s=512x512:d=1", color),
+		"-vframes", "1",
+		"-vf", fmt.Sprintf("drawtext=fontfile='%s':text='%s':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2,drawtext=fontfile='%s':text='%s':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=(h-text_h)/2+60", fontPath, label, fontPath, emotion),
+		placeholder)
+	if err := cmd.Run(); err != nil {
+		return ""
+	}
+	return placeholder
+}
+
+// DialogueLine represents one line in the news show script.
+type DialogueLine struct {
+	Speaker      string `json:"speaker"`       // "sakura" or "haruki"
+	Text         string `json:"text"`
+	Emotion      string `json:"emotion"`       // "neutral","happy","angry","sad","surprised","thinking"
+	SpecialImg   string `json:"special_img,omitempty"` // Special scene description
+	ArticleIndex int    `json:"article_index"` // -1 = opening/closing, 0-N = which article is being discussed
+}
+
+// generateNewsDialogue creates a two-person dialogue script from report results.
+func generateNewsDialogue(articles []struct {
+	title    string
+	url      string
+	summary  string
+	priority int
+}, config *Config) ([]DialogueLine, error) {
+	// Build article summaries
+	var articleBuf strings.Builder
+	for i, a := range articles {
+		articleBuf.WriteString(fmt.Sprintf("%d. [優先度%d] %s\n   URL: %s\n   概要: %s\n\n", i+1, a.priority, a.title, a.url, a.summary))
+	}
+
+	// Get current month/season for special image context
+	month := time.Now().Month()
+	season := "春"
+	switch {
+	case month >= 3 && month <= 5:
+		season = "春"
+	case month >= 6 && month <= 8:
+		season = "夏"
+	case month >= 9 && month <= 11:
+		season = "秋"
+	default:
+		season = "冬"
+	}
+
+	prompt := fmt.Sprintf(`以下のAI/テクノロジーニュース記事をもとに、2人のキャラクターによるカジュアルなニュース番組の台本を生成してください。
+
+## キャラクター
+- sakura: 女性キャスター。明るく親しみやすい。ニュースを紹介する役。
+- haruki: AIロボットアシスタント。分析的で詳しい解説をする。時々ユーモアも。
+
+## ルール
+- 冒頭の挨拶から始め、各ニュースを紹介→解説→感想の流れで進める
+- 1記事あたり4〜6発言（2人合わせて）
+- 最後に締めの挨拶
+- 各発言にはemotionタグを付ける: neutral, happy, angry, sad, surprised, thinking
+- 発言は1文〜2文程度の短さにする（TTS用なので長すぎないこと）
+- 全体で20〜40発言程度
+- 重要: 英語の専門用語はカタカナで表記する（例: LLM→エルエルエム, FLUX→フラックス, Transformer→トランスフォーマー, GPU→ジーピーユー）。読み上げ用のため、アルファベット表記は避ける
+- 特別演出: 最も面白い話題1〜2箇所で、special_imgフィールドに話題や季節(%s・%d月)に関連したキャラクターの特別衣装・シーンを英語で記述（例："sakura wearing a lab coat in a futuristic AI laboratory"）。それ以外のlineではspecial_imgは省略。
+
+## 記事一覧
+%s
+
+## 出力形式（JSON配列のみ出力、他のテキスト不要）
+- article_index: -1=冒頭・締め、0=1番目の記事、1=2番目の記事、...（記事番号は0始まり）
+[
+  {"speaker": "sakura", "text": "...", "emotion": "happy", "article_index": -1},
+  {"speaker": "sakura", "text": "...", "emotion": "neutral", "article_index": 0},
+  {"speaker": "haruki", "text": "...", "emotion": "thinking", "article_index": 0},
+  {"speaker": "sakura", "text": "...", "emotion": "surprised", "article_index": 1, "special_img": "..."},
+  ...
+]`, season, month, articleBuf.String())
+
+	_, resp, err := callSubModel(prompt, config)
+	if err != nil {
+		return nil, fmt.Errorf("dialogue generation failed: %w", err)
+	}
+
+	// Extract JSON array from response
+	resp = strings.TrimSpace(resp)
+	// Find JSON array bounds
+	start := strings.Index(resp, "[")
+	end := strings.LastIndex(resp, "]")
+	if start < 0 || end < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON array found in response")
+	}
+	jsonStr := resp[start : end+1]
+
+	var lines []DialogueLine
+	if err := json.Unmarshal([]byte(jsonStr), &lines); err != nil {
+		return nil, fmt.Errorf("failed to parse dialogue JSON: %w", err)
+	}
+
+	if len(lines) < 4 {
+		return nil, fmt.Errorf("dialogue too short: %d lines", len(lines))
+	}
+
+	return lines, nil
+}
+
+// VOICEVOX speaker IDs
+var voicevoxSpeakers = map[string]int{
+	"sakura": 2,  // 四国めたん (ノーマル)
+	"haruki": 13, // 青山龍星 (ノーマル)
+}
+
+const voicevoxEndpoint = "http://localhost:50021"
+
+// ensureVoicevox starts the VOICEVOX Docker container if not running.
+func ensureVoicevox() error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(voicevoxEndpoint + "/version")
+	if err == nil {
+		resp.Body.Close()
+		return nil
+	}
+	// Start Docker container
+	fmt.Printf("[newsshow] Starting VOICEVOX engine...\n")
+	cmd := exec.Command("docker", "start", "voicevox")
+	if err := cmd.Run(); err != nil {
+		// Container doesn't exist, create it
+		cmd = exec.Command("docker", "run", "-d", "--name", "voicevox",
+			"-p", "50021:50021", "voicevox/voicevox_engine:cpu-latest")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to start VOICEVOX: %w", err)
+		}
+	}
+	// Wait for ready
+	for i := 0; i < 30; i++ {
+		time.Sleep(2 * time.Second)
+		resp, err := client.Get(voicevoxEndpoint + "/version")
+		if err == nil {
+			resp.Body.Close()
+			fmt.Printf("[newsshow] VOICEVOX ready\n")
+			return nil
+		}
+	}
+	return fmt.Errorf("VOICEVOX did not start within 60s")
+}
+
+// synthesizeDialogueLine calls VOICEVOX for a single dialogue line and returns WAV bytes.
+func synthesizeDialogueLine(text string, speaker string) ([]byte, error) {
+	speakerID := voicevoxSpeakers[speaker]
+	if speakerID == 0 {
+		speakerID = 2 // default to 四国めたん
+	}
+
+	// URL-encode the text
+	encodedText := url.QueryEscape(text)
+
+	client := &http.Client{Timeout: 120 * time.Second}
+
+	// Step 1: audio_query
+	queryURL := fmt.Sprintf("%s/audio_query?text=%s&speaker=%d", voicevoxEndpoint, encodedText, speakerID)
+	queryResp, err := client.Post(queryURL, "application/json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("VOICEVOX audio_query failed: %w", err)
+	}
+	defer queryResp.Body.Close()
+	if queryResp.StatusCode != 200 {
+		body, _ := io.ReadAll(queryResp.Body)
+		return nil, fmt.Errorf("VOICEVOX audio_query error %d: %s", queryResp.StatusCode, string(body))
+	}
+	queryData, err := io.ReadAll(queryResp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Modify speed in query
+	var queryJSON map[string]interface{}
+	json.Unmarshal(queryData, &queryJSON)
+	if speaker == "sakura" {
+		queryJSON["speedScale"] = 1.15 // slightly fast
+	} else {
+		queryJSON["speedScale"] = 0.95 // slightly slow, deliberate
+	}
+	queryData, _ = json.Marshal(queryJSON)
+
+	// Step 2: synthesis
+	synthURL := fmt.Sprintf("%s/synthesis?speaker=%d", voicevoxEndpoint, speakerID)
+	synthResp, err := client.Post(synthURL, "application/json", bytes.NewReader(queryData))
+	if err != nil {
+		return nil, fmt.Errorf("VOICEVOX synthesis failed: %w", err)
+	}
+	defer synthResp.Body.Close()
+	if synthResp.StatusCode != 200 {
+		body, _ := io.ReadAll(synthResp.Body)
+		return nil, fmt.Errorf("VOICEVOX synthesis error %d: %s", synthResp.StatusCode, string(body))
+	}
+
+	return io.ReadAll(synthResp.Body)
+}
+
+// getWavDuration returns the duration of a WAV file in seconds.
+func getWavDuration(wavData []byte) float64 {
+	if len(wavData) < 44 {
+		return 1.0
+	}
+	// WAV header: bytes 24-27 = sample rate, bytes 28-31 = byte rate
+	sampleRate := int(wavData[24]) | int(wavData[25])<<8 | int(wavData[26])<<16 | int(wavData[27])<<24
+	byteRate := int(wavData[28]) | int(wavData[29])<<8 | int(wavData[30])<<16 | int(wavData[31])<<24
+	if byteRate == 0 || sampleRate == 0 {
+		return 1.0
+	}
+	dataSize := len(wavData) - 44 // Approximate data section
+	return float64(dataSize) / float64(byteRate)
+}
+
+// composeNewsShowVideo creates an MP4 video from dialogue lines, audio files, and character/article images.
+// Two layouts:
+//   - "talk" (article_index == -1): two characters side by side (opening/closing)
+//   - "article": article screenshot fills main area, speaker portrait in corner
+func composeNewsShowVideo(lines []DialogueLine, audioFiles []string, specialImages map[int]string, articleImages map[int]string, outputPath string) error {
+	tmpDir := newsShowTmpDir()
+
+	var segments []string
+	for i, line := range lines {
+		if i >= len(audioFiles) {
+			break
+		}
+
+		segPath := filepath.Join(tmpDir, fmt.Sprintf("seg_%04d.mp4", i))
+		segments = append(segments, segPath)
+
+		// Speaker info
+		speakerName := "さくら"
+		speakerColor := "&H006045E9" // ASS BGR pink
+		if line.Speaker == "haruki" {
+			speakerName = "はるき"
+			speakerColor = "&H00C4CD4E" // ASS BGR teal
+		}
+
+		// Subtitle text (wrap)
+		subtitle := line.Text
+		if len([]rune(subtitle)) > 28 {
+			runes := []rune(subtitle)
+			mid := len(runes) / 2
+			for j := mid; j < len(runes) && j < mid+5; j++ {
+				if runes[j] == '。' || runes[j] == '、' || runes[j] == '！' || runes[j] == '？' {
+					mid = j + 1
+					break
+				}
+			}
+			subtitle = string(runes[:mid]) + "\\N" + string(runes[mid:])
+		}
+
+		// Audio duration for ASS timing
+		wavData, _ := os.ReadFile(audioFiles[i])
+		dur := getWavDuration(wavData)
+		if dur < 0.5 {
+			dur = 3.0
+		}
+		endTime := fmt.Sprintf("0:%02d:%05.2f", int(dur)/60, dur-float64(int(dur)/60*60))
+
+		// Decide layout: "article" if we have an article image for this line
+		artIdx := line.ArticleIndex
+		artImgPath, hasArticleImg := articleImages[artIdx]
+		useArticleLayout := artIdx >= 0 && hasArticleImg
+
+		// Write ASS
+		assContent := fmt.Sprintf(`[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Title,Noto Sans CJK JP,28,&H00FFFFFF,&H000000FF,&H00000000,&HA0000000,1,0,0,0,100,100,0,0,1,2,1,7,30,30,15,1
+Style: Speaker,Noto Sans CJK JP,26,%s,&H000000FF,&H00000000,&HA0000000,1,0,0,0,100,100,0,0,1,2,1,2,10,10,230,1
+Style: Sub,Noto Sans CJK JP,32,&H00FFFFFF,&H000000FF,&H00000000,&HA0000000,0,0,0,0,100,100,0,0,1,3,2,2,40,40,25,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,%s,Title,,0,0,0,,AI News Show
+Dialogue: 1,0:00:00.00,%s,Speaker,,0,0,0,,%s
+Dialogue: 2,0:00:00.00,%s,Sub,,0,0,0,,%s
+`, speakerColor, endTime, endTime, speakerName, endTime, subtitle)
+
+		assPath := filepath.Join(tmpDir, fmt.Sprintf("sub_%04d.ass", i))
+		os.WriteFile(assPath, []byte(assContent), 0644)
+
+		var args []string
+		args = append(args, "-y", "-i", audioFiles[i])
+
+		var filters []string
+
+		if useArticleLayout {
+			// === ARTICLE LAYOUT ===
+			// Article screenshot in center, sakura on left edge, haruki on right edge
+			args = append(args, "-i", artImgPath) // input 1
+
+			// Sakura (left) and Haruki (right) - emotion for speaker, neutral for other
+			sakuraEmotion := "neutral"
+			harukiEmotion := "neutral"
+			if line.Speaker == "sakura" {
+				sakuraEmotion = line.Emotion
+			} else {
+				harukiEmotion = line.Emotion
+			}
+			sakuraImg := getCharacterImage("sakura", sakuraEmotion)
+			harukiImg := getCharacterImage("haruki", harukiEmotion)
+			// Override with special image if available
+			if sp, ok := specialImages[i]; ok && sp != "" {
+				if line.Speaker == "sakura" {
+					sakuraImg = sp
+				} else {
+					harukiImg = sp
+				}
+			}
+
+			inputIdx := 2
+			hasSakura := sakuraImg != ""
+			hasHaruki := harukiImg != ""
+			if hasSakura {
+				args = append(args, "-i", sakuraImg) // input 2
+				inputIdx++
+			}
+			if hasHaruki {
+				args = append(args, "-i", harukiImg) // input 3
+				inputIdx++
+			}
+
+			// Background
+			filters = append(filters, "color=c=0x1a1a2e:s=1280x720:d=999[bg]")
+			// Article screenshot in center (narrower to leave room for characters)
+			filters = append(filters, "[1:v]scale=700:440:force_original_aspect_ratio=decrease,pad=700:440:(ow-iw)/2:(oh-ih)/2:color=0x1a1a2e[artscaled]")
+			filters = append(filters, "[bg][artscaled]overlay=290:50[withart]")
+
+			currentBase := "[withart]"
+			charInputIdx := 2
+			// Sakura on left edge
+			if hasSakura {
+				filters = append(filters, fmt.Sprintf("[%d:v]scale=200:200[sakura]", charInputIdx))
+				filters = append(filters, fmt.Sprintf("%s[sakura]overlay=30:480[wsakura]", currentBase))
+				currentBase = "[wsakura]"
+				charInputIdx++
+			}
+			// Haruki on right edge
+			if hasHaruki {
+				filters = append(filters, fmt.Sprintf("[%d:v]scale=200:200[haruki]", charInputIdx))
+				filters = append(filters, fmt.Sprintf("%s[haruki]overlay=1050:480[wharuki]", currentBase))
+				currentBase = "[wharuki]"
+			}
+
+			// Speaker highlight border
+			if line.Speaker == "sakura" && hasSakura {
+				filters = append(filters, fmt.Sprintf("%sdrawbox=x=25:y=475:w=210:h=210:color=0xE94560:t=3[composed]", currentBase))
+			} else if line.Speaker == "haruki" && hasHaruki {
+				filters = append(filters, fmt.Sprintf("%sdrawbox=x=1045:y=475:w=210:h=210:color=0x4ECDC4:t=3[composed]", currentBase))
+			} else {
+				filters = append(filters, fmt.Sprintf("%scopy[composed]", currentBase))
+			}
+
+			// Apply ASS
+			filters = append(filters, fmt.Sprintf("[composed]ass='%s'[out]", strings.ReplaceAll(assPath, "'", "'\\''")))
+		} else {
+			// === TALK LAYOUT (opening/closing/transition) ===
+			// sakura always left, haruki always right
+			sakuraEmotion := "neutral"
+			harukiEmotion := "neutral"
+			if line.Speaker == "sakura" {
+				sakuraEmotion = line.Emotion
+			} else {
+				harukiEmotion = line.Emotion
+			}
+			// Use special image for the speaker if available
+			leftChar := getCharacterImage("sakura", sakuraEmotion)
+			rightChar := getCharacterImage("haruki", harukiEmotion)
+			if sp, ok := specialImages[i]; ok && sp != "" {
+				if line.Speaker == "sakura" {
+					leftChar = sp
+				} else {
+					rightChar = sp
+				}
+			}
+
+			hasLeft := leftChar != ""
+			hasRight := rightChar != ""
+			if hasLeft {
+				args = append(args, "-i", leftChar)
+			}
+			if hasRight {
+				args = append(args, "-i", rightChar)
+			}
+
+			filters = append(filters, "color=c=0x1a1a2e:s=1280x720:d=999[bg]")
+			inputIdx := 1
+			currentBase := "[bg]"
+
+			if hasLeft {
+				filters = append(filters, fmt.Sprintf("[%d:v]scale=300:300[left]", inputIdx))
+				filters = append(filters, fmt.Sprintf("%s[left]overlay=100:120[wl]", currentBase))
+				currentBase = "[wl]"
+				inputIdx++
+			}
+			if hasRight {
+				filters = append(filters, fmt.Sprintf("[%d:v]scale=300:300[right]", inputIdx))
+				filters = append(filters, fmt.Sprintf("%s[right]overlay=880:120[wr]", currentBase))
+				currentBase = "[wr]"
+			}
+
+			// Speaker highlight border
+			if line.Speaker == "sakura" && hasLeft {
+				filters = append(filters, fmt.Sprintf("%sdrawbox=x=95:y=115:w=310:h=310:color=0xE94560:t=4[framed]", currentBase))
+			} else if line.Speaker == "haruki" && hasRight {
+				filters = append(filters, fmt.Sprintf("%sdrawbox=x=875:y=115:w=310:h=310:color=0x4ECDC4:t=4[framed]", currentBase))
+			} else {
+				filters = append(filters, fmt.Sprintf("%scopy[framed]", currentBase))
+			}
+
+			filters = append(filters, fmt.Sprintf("[framed]ass='%s'[out]", strings.ReplaceAll(assPath, "'", "'\\''")))
+		}
+
+		filterStr := strings.Join(filters, ";")
+		args = append(args,
+			"-filter_complex", filterStr,
+			"-map", "[out]", "-map", "0:a",
+			"-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+			"-c:a", "aac", "-b:a", "128k",
+			"-pix_fmt", "yuv420p",
+			"-shortest",
+			segPath,
+		)
+
+		cmd := exec.Command("ffmpeg", args...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("[newsshow] ffmpeg segment %d failed: %v\n%s\n", i, err, string(out))
+			return fmt.Errorf("ffmpeg segment %d: %w", i, err)
+		}
+		os.Remove(assPath)
+		fmt.Printf("[newsshow] Segment %d/%d done (%s)\n", i+1, len(lines), map[bool]string{true: "article", false: "talk"}[useArticleLayout])
+	}
+
+	// Concatenate all segments
+	concatList := filepath.Join(tmpDir, "concat.txt")
+	var listBuf strings.Builder
+	for _, seg := range segments {
+		listBuf.WriteString(fmt.Sprintf("file '%s'\n", seg))
+	}
+	if err := os.WriteFile(concatList, []byte(listBuf.String()), 0644); err != nil {
+		return err
+	}
+
+	concatCmd := exec.Command("ffmpeg", "-y", "-f", "concat", "-safe", "0",
+		"-i", concatList, "-c", "copy", outputPath)
+	out, err := concatCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg concat: %w\n%s", err, string(out))
+	}
+
+	// Cleanup temp files
+	for _, seg := range segments {
+		os.Remove(seg)
+	}
+	os.Remove(concatList)
+
+	return nil
+}
+
+// generateNewsShow creates an AI news show video from Bluesky report results.
+func (ws *WebServer) generateNewsShow(results []deepDiveResult) {
+	if len(results) == 0 {
+		return
+	}
+
+	ws.mu.RLock()
+	config := ws.config
+	ws.mu.RUnlock()
+
+	fmt.Printf("[newsshow] Starting news show generation (%d articles)\n", len(results))
+	t0 := time.Now()
+
+	// 1. Try to generate character images (non-blocking — uses placeholders if image server not ready)
+	go func() {
+		if err := ensureCharacterImages(config); err != nil {
+			fmt.Printf("[newsshow] Character image generation skipped: %v (using placeholders)\n", err)
+		}
+	}()
+
+	// 2. Prepare article data and save article images for video
+	tmpDir := newsShowTmpDir()
+	var articles []struct {
+		title    string
+		url      string
+		summary  string
+		priority int
+	}
+	articleImages := make(map[int]string) // index -> image file path
+	for i, r := range results {
+		summary := r.meta.DeepSummary
+		if summary == "" {
+			summary = r.meta.PostText
+		}
+		articles = append(articles, struct {
+			title    string
+			url      string
+			summary  string
+			priority int
+		}{
+			title:    r.meta.OGPTitle,
+			url:      r.meta.URL,
+			summary:  truncateStr(summary, 200),
+			priority: r.meta.DeliveryPriority,
+		})
+
+		// Save screenshot or fetch OGP image for article visual
+		imgPath := filepath.Join(tmpDir, fmt.Sprintf("article_%d.png", i))
+		if len(r.screenshot) > 0 {
+			if err := os.WriteFile(imgPath, r.screenshot, 0644); err == nil {
+				articleImages[i] = imgPath
+				fmt.Printf("[newsshow] Article %d: screenshot saved\n", i)
+			}
+		} else if r.meta.OGPImage != "" {
+			// Download OGP image
+			client := &http.Client{Timeout: 15 * time.Second}
+			resp, err := client.Get(r.meta.OGPImage)
+			if err == nil {
+				data, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil && len(data) > 0 {
+					if err := os.WriteFile(imgPath, data, 0644); err == nil {
+						articleImages[i] = imgPath
+						fmt.Printf("[newsshow] Article %d: OGP image saved\n", i)
+					}
+				}
+			}
+		}
+		// If no image yet, take a fresh screenshot
+		if _, ok := articleImages[i]; !ok && r.meta.URL != "" {
+			ssData, err := scraplingScreenshot(r.meta.URL)
+			if err == nil && len(ssData) > 0 {
+				if err := os.WriteFile(imgPath, ssData, 0644); err == nil {
+					articleImages[i] = imgPath
+					fmt.Printf("[newsshow] Article %d: live screenshot taken\n", i)
+				}
+			}
+		}
+	}
+	fmt.Printf("[newsshow] Prepared %d article images\n", len(articleImages))
+
+	// 3. Generate dialogue script
+	fmt.Printf("[newsshow] Generating dialogue script...\n")
+	dialogue, err := generateNewsDialogue(articles, config)
+	if err != nil {
+		fmt.Printf("[newsshow] Dialogue generation failed: %v\n", err)
+		return
+	}
+	fmt.Printf("[newsshow] Generated %d dialogue lines\n", len(dialogue))
+
+	// 4. Ensure VOICEVOX is running
+	if err := ensureVoicevox(); err != nil {
+		fmt.Printf("[newsshow] VOICEVOX not available: %v\n", err)
+		return
+	}
+
+	// 5. Synthesize audio for each line
+	var audioFiles []string
+	for i, line := range dialogue {
+		fmt.Printf("[newsshow] TTS %d/%d: %s「%s」\n", i+1, len(dialogue), line.Speaker, truncateStr(line.Text, 20))
+		wavData, err := synthesizeDialogueLine(line.Text, line.Speaker)
+		if err != nil {
+			fmt.Printf("[newsshow] TTS failed for line %d: %v\n", i, err)
+			return
+		}
+		audioPath := filepath.Join(tmpDir, fmt.Sprintf("line_%04d.wav", i))
+		if err := os.WriteFile(audioPath, wavData, 0644); err != nil {
+			fmt.Printf("[newsshow] Failed to save audio: %v\n", err)
+			return
+		}
+		audioFiles = append(audioFiles, audioPath)
+	}
+
+	// 6. Generate special images for marked lines
+	specialImages := make(map[int]string)
+	for i, line := range dialogue {
+		if line.SpecialImg != "" {
+			fmt.Printf("[newsshow] Generating special image %d: %s\n", i, truncateStr(line.SpecialImg, 50))
+			imgURL, err := generateImage(line.SpecialImg+", anime style, high quality illustration, upper body portrait", 512, 512, config)
+			if err != nil {
+				fmt.Printf("[newsshow] Special image generation failed: %v\n", err)
+				continue
+			}
+			// Copy to tmp for ffmpeg
+			srcPath := filepath.Join(playgroundDir, filepath.Base(imgURL))
+			specialImages[i] = srcPath
+		}
+	}
+
+	// 7. Compose video
+	fmt.Printf("[newsshow] Composing video...\n")
+	outputFilename := fmt.Sprintf("newsshow_%s.mp4", time.Now().Format("20060102_1504"))
+	outputPath := filepath.Join(playgroundDir, outputFilename)
+	if err := composeNewsShowVideo(dialogue, audioFiles, specialImages, articleImages, outputPath); err != nil {
+		fmt.Printf("[newsshow] Video composition failed: %v\n", err)
+		return
+	}
+
+	// Cleanup audio temp files
+	for _, f := range audioFiles {
+		os.Remove(f)
+	}
+
+	elapsed := time.Since(t0)
+	// Get file size
+	fi, _ := os.Stat(outputPath)
+	var sizeMB float64
+	if fi != nil {
+		sizeMB = float64(fi.Size()) / 1024 / 1024
+	}
+	fmt.Printf("[newsshow] Video complete: %s (%.1f MB, took %s)\n", outputFilename, sizeMB, elapsed.Round(time.Second))
+
+	// 7. Save as thread
+	now := time.Now()
+	threadID := fmt.Sprintf("newsshow-%s", now.Format("20060102-1504"))
+	videoURL := "/playground/" + outputFilename
+
+	// Build thread content with video and script
+	var mdBuf strings.Builder
+	mdBuf.WriteString(fmt.Sprintf("# AI News Show\n\n%s\n\n", now.Format("2006年01月02日 15:04")))
+	mdBuf.WriteString(fmt.Sprintf("<video src=\"%s\" controls autoplay style=\"max-width:100%%; border-radius:12px;\"></video>\n\n", videoURL))
+	mdBuf.WriteString("---\n\n## 台本\n\n")
+	for _, line := range dialogue {
+		name := "🌸 さくら"
+		if line.Speaker == "haruki" {
+			name = "🤖 はるき"
+		}
+		mdBuf.WriteString(fmt.Sprintf("**%s**: %s\n\n", name, line.Text))
+	}
+	mdBuf.WriteString("---\n\n## 紹介記事\n\n")
+	for i, a := range articles {
+		mdBuf.WriteString(fmt.Sprintf("%d. [%s](%s) (優先度: %d)\n", i+1, a.title, a.url, a.priority))
+	}
+
+	title := fmt.Sprintf("AI News Show - %s", now.Format("01/02 15:04"))
+	t2 := &Thread{
+		ID:        threadID,
+		Title:     title,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Unread:    true,
+		Proactive: true,
+	}
+	if err := saveThread(t2); err != nil {
+		fmt.Printf("[newsshow] Failed to save thread: %v\n", err)
+		return
+	}
+	appendMessageToThread(threadID, Message{
+		Role:    "assistant",
+		Content: mdBuf.String(),
+	}, "")
+	fmt.Printf("[newsshow] Saved thread: %s\n", threadID)
 }
 
 // Jetstream event types
@@ -15710,6 +16627,88 @@ func stopScraplingServer() {
 	scraplingServerReady = false
 }
 
+// --- TTS (Irodori-TTS) server management ---
+
+var (
+	ttsServerProcess *exec.Cmd
+	ttsServerReady   bool
+	ttsServerMu      sync.Mutex
+	ttsEndpoint      = "http://localhost:8104"
+)
+
+func startTTSServer() error {
+	ttsServerMu.Lock()
+	defer ttsServerMu.Unlock()
+
+	if ttsServerReady {
+		return nil
+	}
+
+	home, _ := os.UserHomeDir()
+	scriptPath := filepath.Join(home, "Irodori-TTS", "tts_server.py")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return fmt.Errorf("TTS server script not found: %s", scriptPath)
+	}
+
+	pythonPath := filepath.Join(home, "knowledgeCore", "venv", "bin", "python3")
+	if _, err := os.Stat(pythonPath); err != nil {
+		pythonPath = "python3"
+	}
+
+	fmt.Printf("[siki] Starting TTS server with %s...\n", pythonPath)
+	cmd := exec.Command(pythonPath, scriptPath, "--port", "8104")
+	cmd.Dir = filepath.Join(home, "Irodori-TTS")
+	cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(home, "Irodori-TTS"))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start TTS server: %w", err)
+	}
+	ttsServerProcess = cmd
+
+	// Wait for server to be ready (model load can take a while)
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		resp, err := client.Get(ttsEndpoint + "/health")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				ttsServerReady = true
+				fmt.Println("[siki] TTS server ready")
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("TTS server startup timeout")
+}
+
+func ensureTTSServer() error {
+	if ttsServerReady {
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(ttsEndpoint + "/health")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return nil
+			}
+		}
+		ttsServerReady = false
+	}
+	return startTTSServer()
+}
+
+func stopTTSServer() {
+	ttsServerMu.Lock()
+	defer ttsServerMu.Unlock()
+	if ttsServerProcess != nil && ttsServerProcess.Process != nil {
+		ttsServerProcess.Process.Kill()
+		ttsServerProcess = nil
+	}
+	ttsServerReady = false
+}
+
 // scraplingFetch fetches a URL using the Scrapling server, returns extracted text.
 func scraplingFetch(targetURL string, maxLength int, stealth bool) (string, string, []map[string]string, error) {
 	if err := ensureScraplingServer(); err != nil {
@@ -19920,6 +20919,111 @@ func runWeb(config *Config, host string, port int) error {
 		go ws.analyzeJetstreamPosts()
 		json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 	})
+	http.HandleFunc("/api/jetstream/report", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Reset rate limiter to force immediate report
+		lastJetstreamReportMu.Lock()
+		lastJetstreamReportTime = time.Time{}
+		lastJetstreamReportMu.Unlock()
+		go ws.jetstreamDeepDiveReport()
+		json.NewEncoder(w).Encode(map[string]string{"status": "report_started"})
+	})
+
+	// TTS API
+	http.HandleFunc("/api/tts", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Text  string  `json:"text"`
+			Speed float64 `json:"speed"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Text == "" {
+			http.Error(w, "empty text", http.StatusBadRequest)
+			return
+		}
+		if req.Speed <= 0 {
+			req.Speed = 1.2
+		}
+
+		if err := ensureTTSServer(); err != nil {
+			http.Error(w, "TTS server unavailable: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		// Forward to TTS server
+		ttsReq, _ := json.Marshal(map[string]interface{}{
+			"text":  req.Text,
+			"speed": req.Speed,
+		})
+		client := &http.Client{Timeout: 120 * time.Second}
+		resp, err := client.Post(ttsEndpoint+"/tts", "application/json", bytes.NewReader(ttsReq))
+		if err != nil {
+			http.Error(w, "TTS request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			http.Error(w, "TTS error: "+string(body), resp.StatusCode)
+			return
+		}
+
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Header().Set("Cache-Control", "no-cache")
+		io.Copy(w, resp.Body)
+	})
+
+	// News Show manual trigger API
+	http.HandleFunc("/api/newsshow", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		// Collect recent high-score Bluesky posts for the show
+		ws.mu.RLock()
+		config := ws.config
+		ws.mu.RUnlock()
+		_ = config
+
+		// Gather recent posts
+		now := time.Now()
+		var results []deepDiveResult
+		for dayOffset := 0; dayOffset < 3; dayOffset++ {
+			day := now.AddDate(0, 0, -dayOffset)
+			meta := loadJetstreamMeta(day)
+			for _, m := range meta {
+				if m.Score >= 6 && m.OGPTitle != "" {
+					results = append(results, deepDiveResult{meta: m})
+				}
+			}
+		}
+		if len(results) == 0 {
+			http.Error(w, "No articles available", http.StatusNotFound)
+			return
+		}
+		// Sort by priority descending and take top 5
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].meta.DeliveryPriority > results[j].meta.DeliveryPriority
+		})
+		if len(results) > 5 {
+			results = results[:5]
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "generating",
+			"articles": len(results),
+		})
+
+		go ws.generateNewsShow(results)
+	})
 
 	// Skills API
 	http.HandleFunc("/api/skills", func(w http.ResponseWriter, r *http.Request) {
@@ -20082,7 +21186,7 @@ func runWeb(config *Config, host string, port int) error {
 	if config.SubAgent != "" {
 		backend := config.SubAgentBackend
 		if backend == "" {
-			backend = "vllm"
+			backend = "ollama"
 		}
 		endpoint := config.SubAgentEndpoint
 		if endpoint == "" {
@@ -20170,6 +21274,7 @@ func runWeb(config *Config, host string, port int) error {
 		stopImageServer()
 		stopVideoServer()
 		stopScraplingServer()
+		stopTTSServer()
 		stopDockerContainer()
 		server.Close()
 	}()
@@ -20227,6 +21332,7 @@ func runChat(config *Config) error {
 		stopImageServer()
 		stopVideoServer()
 		stopScraplingServer()
+		stopTTSServer()
 		stopDockerContainer()
 		cancel()
 		os.Exit(0)
